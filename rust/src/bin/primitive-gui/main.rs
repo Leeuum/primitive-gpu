@@ -16,7 +16,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
@@ -36,7 +36,13 @@ struct App {
     tmp: PathBuf,
     renders: PathBuf,
     uploads: Arc<AtomicU64>,
+    /// How many pages have their live connection open.
+    pages: Arc<AtomicUsize>,
 }
+
+/// The program stops by itself after this long with no page open and
+/// nothing to do, so it does not keep running unseen after the tab closes.
+const IDLE_STOP: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 impl App {
     fn send(&self, c: Cmd) {
@@ -170,12 +176,13 @@ async fn serve(port: u16, open: bool) {
         let slot = slot.clone();
         std::thread::spawn(move || worker::encoder(slot, pic_tx));
     }
+    let busy = Arc::new(AtomicBool::new(false));
     let worker_done = {
-        let (tmp, renders, status_tx) = (tmp.clone(), renders.clone(), status_tx.clone());
+        let (tmp, renders, status_tx, busy) = (tmp.clone(), renders.clone(), status_tx.clone(), busy.clone());
         std::thread::spawn(move || {
             let st = status_tx.clone();
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                Worker::new(cmd_rx, tmp, renders, st, orig_tx, slot).run();
+                Worker::new(cmd_rx, tmp, renders, st, orig_tx, slot, busy).run();
             }));
             if let Err(e) = r {
                 let msg = e
@@ -200,6 +207,7 @@ async fn serve(port: u16, open: bool) {
         tmp: tmp.clone(),
         renders,
         uploads: Arc::new(AtomicU64::new(0)),
+        pages: Arc::new(AtomicUsize::new(0)),
     };
     let router = Router::new()
         .route("/", get(|| async { ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], INDEX) }))
@@ -221,16 +229,21 @@ async fn serve(port: u16, open: bool) {
     }
     println!("Renders are saved in {renders_text}");
     println!("To stop it, close this window or press Ctrl+C.");
+    println!("It also stops by itself {} minutes after the last browser tab closes, unless it is still working.", IDLE_STOP.as_secs() / 60);
     if open {
         open_browser(&url);
     }
 
-    // Stop on Ctrl+C, and when the launcher or a logout ends the program.
-    // Open pages never close their live connection, so this does not wait
-    // for them: it stops the worker (which stops ffmpeg), removes the temp
-    // files and exits.
+    // Stop on Ctrl+C, when the launcher or a logout ends the program, or
+    // after IDLE_STOP with no page open and nothing to do. Open pages never
+    // close their live connection, so this does not wait for them: it stops
+    // the worker (which stops ffmpeg), removes the temp files and exits.
+    let pages = app.pages.clone();
     tokio::spawn(async move {
-        stop_signal().await;
+        tokio::select! {
+            _ = stop_signal() => {}
+            _ = idle_stop(pages, busy) => println!("No browser tab open for {} minutes.", IDLE_STOP.as_secs() / 60),
+        }
         println!("Stopping...");
         app.send(Cmd::Quit);
         let join = tokio::task::spawn_blocking(move || worker_done.join());
@@ -239,6 +252,20 @@ async fn serve(port: u16, open: bool) {
         std::process::exit(0);
     });
     let _ = axum::serve(listener, router).await;
+}
+
+/// Returns once no page has been open and the worker has been idle for
+/// `IDLE_STOP` in a row.
+async fn idle_stop(pages: Arc<AtomicUsize>, busy: Arc<AtomicBool>) {
+    let mut idle_since = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        if pages.load(Ordering::Relaxed) > 0 || busy.load(Ordering::Relaxed) {
+            idle_since = tokio::time::Instant::now();
+        } else if idle_since.elapsed() >= IDLE_STOP {
+            return;
+        }
+    }
 }
 
 /// Waits for Ctrl+C, or for the system to end the program (logout, the
@@ -389,6 +416,15 @@ async fn ws(State(app): State<App>, upgrade: WebSocketUpgrade) -> Response {
 /// One page: commands in; status and the newest picture out. A slow page
 /// only ever gets the newest picture, so the worker never waits for it.
 async fn live(app: App, socket: WebSocket) {
+    // Counts this page as open until the function returns, however it returns.
+    struct Open(Arc<AtomicUsize>);
+    impl Drop for Open {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    app.pages.fetch_add(1, Ordering::Relaxed);
+    let _open = Open(app.pages.clone());
     let (mut tx, mut rx) = socket.split();
     let mut status = app.status.clone();
     let mut picture = app.picture.clone();

@@ -12,7 +12,9 @@ Double-click "primitive-gui". A small text window opens, and then the
 program opens in your web browser. If the browser does not open, go to
 http://localhost:8640 yourself.
 
-To stop it, close the small text window.
+To stop it, close the small text window. It also stops by itself
+10 minutes after you close the last browser tab, unless it is still
+rendering or building.
 
 Your renders are saved in the "primitive" folder inside your Videos
 folder (Movies on a Mac).

@@ -391,6 +391,8 @@ pub struct Worker {
     status_tx: Arc<watch::Sender<String>>,
     original_tx: watch::Sender<Arc<Vec<u8>>>,
     pics: Arc<PicSlot>,
+    /// Set while the worker has work no page needs to watch (see `is_busy`).
+    busy: Arc<AtomicBool>,
     last_publish: Instant,
     dirty_pic: bool,
     dirty_status: bool,
@@ -451,6 +453,7 @@ impl Worker {
         status_tx: Arc<watch::Sender<String>>,
         original_tx: watch::Sender<Arc<Vec<u8>>>,
         pics: Arc<PicSlot>,
+        busy: Arc<AtomicBool>,
     ) -> Worker {
         let settings = Settings::default();
         Worker {
@@ -474,6 +477,7 @@ impl Worker {
             status_tx,
             original_tx,
             pics,
+            busy,
             last_publish: Instant::now(),
             dirty_pic: false,
             dirty_status: true,
@@ -510,7 +514,15 @@ impl Worker {
             }
             self.tick();
             self.publish(false);
+            self.busy.store(self.is_busy(), Ordering::Relaxed);
         }
+    }
+
+    /// True while loading a video, rendering, or still adding shapes. The
+    /// server does not stop by itself while this is true. Playing a video
+    /// does not count.
+    fn is_busy(&self) -> bool {
+        self.decode.is_some() || self.render.is_some() || self.idle_wait().is_none() || self.rt_wait().is_some()
     }
 
     fn shutdown(&mut self) {
