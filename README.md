@@ -106,8 +106,7 @@ To add a shape, add a variant to the `Shape` enum in `rust/src/shapes.rs`, handl
 ## Credits
 
 - **Michael Fogleman** created the original [primitive](https://github.com/fogleman/primitive) algorithm and Go program (MIT licence). This port follows its design, flags and shape modes, and uses its example pictures.
-- **Leeuum** made this Rust and GPU port and the browser GUI.
-- Written with **Claude** (Anthropic's AI model), using [Claude Code](https://claude.com/claude-code).
+- Written with **Claude**, using [Claude Code](https://claude.com/claude-code).
 
 ## Licence
 
