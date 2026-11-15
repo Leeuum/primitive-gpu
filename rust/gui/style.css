@@ -183,6 +183,5 @@ code { background: #222; color: #ddd; padding: 0 3px; font-size: 11px; font-fami
 #tip p { margin: 0 0 6px; }
 #tip p:last-child { margin-bottom: 0; }
 #tip .tip-label { color: var(--accent); font-weight: 600; }
-[data-tip] { cursor: help; }
 [data-tip] input, [data-tip] select { cursor: auto; }
 details.sec > summary[data-tip] { cursor: pointer; }

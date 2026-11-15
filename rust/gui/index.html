@@ -126,7 +126,8 @@
       <label>Random tries per chain <input type="number" id="random" min="1" max="100000"></label>
       <label>Age (tries without gain) <input type="number" id="age" min="1" max="100000"></label>
       <label>Mutations per round (k) <input type="number" id="k" min="1" max="1024"></label>
-      <label>Seed <span class="hint">empty = random; restart to apply</span><input type="text" id="seed" placeholder="random"></label>
+      <label>Seed <span class="hint">restart to apply</span><input type="text" id="seed" inputmode="numeric"></label>
+      <label class="radio"><input type="checkbox" id="seed_lock"> manual seed (keep this number)</label>
       <div class="hint" id="gpu"></div>
       <button id="ask-reset" hidden>Show skipped warnings again</button>
     </details>

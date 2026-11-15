@@ -79,7 +79,7 @@ function send(obj) {
 
 const NUM = ["count", "min_count", "mode", "alpha", "work_size", "out_w", "out_h", "repeat", "chains", "random", "age", "k", "frame_digits", "frame_start"];
 const FLOAT = ["seq_fps"];
-const TEXT = ["background", "seed", "metric", "out_preset", "export_fmt", "name_pattern"];
+const TEXT = ["background", "metric", "out_preset", "export_fmt", "name_pattern"];
 const ALL = NUM.concat(FLOAT, TEXT);
 
 const FORMATS = {
@@ -116,6 +116,8 @@ function readSettings() {
   s.target_score = Number.isFinite(ts) && ts > 0 ? ts : 0;
   s.build_on = document.querySelector('input[name=frames][value=build]').checked;
   s.realtime = $("realtime").checked;
+  // Unticked "Manual seed" sends an empty seed: a new random one each Restart.
+  s.seed = $("seed_lock").checked ? $("seed").value.trim() : "";
   return s;
 }
 
@@ -144,6 +146,19 @@ function fillSettings(s) {
     $("realtime").checked = !!s.realtime;
     if (/^#?[0-9a-fA-F]{6}$/.test(s.background)) $("background-pick").value = "#" + s.background.replace("#", "");
   }
+  fillSeed(s, typing);
+}
+
+// Seed: unticked shows the seed in use, greyed out. Ticked keeps the number
+// and makes it editable. Ticking keeps the number that is showing.
+function fillSeed(s, typing) {
+  const lock = $("seed_lock"), el = $("seed");
+  if (!typing) lock.checked = s.seed !== "";
+  el.disabled = !lock.checked;
+  if (el === document.activeElement || typing) return;
+  const v = lock.checked ? s.seed : ((st && st.seed) || "");
+  if (el.value !== v) el.value = v;
+  el.placeholder = lock.checked ? "type a number" : "random";
 }
 
 for (const k of ALL) {
@@ -190,6 +205,8 @@ $("settings-file").addEventListener("change", async () => {
 });
 $("target_score").addEventListener("change", sendSettings);
 $("realtime").addEventListener("change", sendSettings);
+$("seed").addEventListener("change", sendSettings);
+$("seed_lock").addEventListener("change", () => { $("seed").disabled = !$("seed_lock").checked; sendSettings(); });
 // Typing a name pattern updates the example name shortly after.
 let patternTimer = null;
 $("name_pattern").addEventListener("input", () => {
@@ -350,11 +367,14 @@ $("restart").onclick = async () => {
   send({ t: "restart" });
 };
 
+let exporting = false; // a single-image export is downloading
+
 $("render").onclick = async () => {
   if (!st) return;
   if (st.render) { send({ t: "cancel" }); myRender = false; return; }
   if (st.kind === "video") { myRender = true; send({ t: "render" }); return; }
   const fmt = $("export_fmt").value;
+  exporting = true;
   $("render").disabled = true;
   $("render").textContent = ["mp4", "webm", "gif"].includes(fmt) ? "Making video…" : "Exporting…";
   try {
@@ -367,7 +387,7 @@ $("render").onclick = async () => {
   } catch (e) {
     localError = `Export failed: ${e.message}`;
   }
-  $("render").disabled = false;
+  exporting = false;
   render();
 };
 
@@ -544,7 +564,7 @@ function render() {
     rb.textContent = "Cancel";
     rb.className = "danger";
     rb.disabled = false;
-  } else if (rb.textContent !== "Exporting…" && rb.textContent !== "Making video…") {
+  } else if (!exporting) {
     rb.className = "primary";
     rb.textContent = isVideo ? "Render" : "Export";
     rb.disabled = !ready;
@@ -659,8 +679,8 @@ const TIPS = {
     "Try Plain gaps with triangles or rectangles."],
   seed: ["Seed",
     "The starting number for the random choices.",
-    "Empty gives a new result each time. Type any number to get the same result again with the same settings. Restart to apply.",
-    "Type 1, note the result, then try 2 to compare."],
+    "The box shows the seed of the current picture. With Manual seed off, each Restart picks a new one. Turn Manual seed on to keep the number, or to type your own; the same seed and settings give the same result again. Restart to apply.",
+    "Restart until you like the result, then tick Manual seed and Save the settings."],
   export_fmt: ["File type",
     "The kind of file that Render makes.",
     "PNG keeps every pixel exact. JPG is smaller. SVG keeps the shapes as shapes, so you can scale it to any size or edit it in Inkscape or Illustrator. For a video, the sequence types save one file per frame in a folder.",

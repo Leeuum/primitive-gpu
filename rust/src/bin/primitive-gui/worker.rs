@@ -370,6 +370,8 @@ pub struct Worker {
     settings: Settings,
     /// `restart_key` of the settings the current job was started with.
     applied: (u32, String, String, String),
+    /// The seed the current search was started with (shown on the page).
+    used_seed: u64,
     source: Source,
     model: Option<Model>,
     playing: bool,
@@ -441,8 +443,11 @@ fn remove_path(p: &Path) {
     }
 }
 
+/// A random seed from the clock, kept to 9 digits so it is easy to read
+/// and type back in.
 fn now_seed() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)
+    let n = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
+    n % 999_999_999 + 1
 }
 
 impl Worker {
@@ -461,6 +466,7 @@ impl Worker {
             tmp,
             renders,
             applied: settings.restart_key(),
+            used_seed: 0,
             settings,
             source: Source::None,
             model: None,
@@ -956,6 +962,15 @@ impl Worker {
         self.decode_video(dir, name, info, Some(files));
     }
 
+    /// True when a setting changed that only "Restart" applies. An empty
+    /// seed (random) or the seed already in use needs no restart, so ticking
+    /// "Manual seed" keeps the current picture.
+    fn needs_restart(&self) -> bool {
+        let (k, a) = (self.settings.restart_key(), &self.applied);
+        let seed_ok = k.2.is_empty() || k.2 == self.used_seed.to_string();
+        k.0 != a.0 || k.1 != a.1 || k.3 != a.3 || !seed_ok
+    }
+
     fn seed(&self) -> u64 {
         self.settings.seed.parse().unwrap_or_else(|_| now_seed())
     }
@@ -968,8 +983,10 @@ impl Worker {
 
     fn new_model(&mut self, target: Vec<u8>, w: i32, h: i32) -> bool {
         let bg = self.bg_for(&target);
-        match Model::new(target, w, h, bg, PREVIEW, self.settings.search(), self.seed()) {
+        let seed = self.seed();
+        match Model::new(target, w, h, bg, PREVIEW, self.settings.search(), seed) {
             Ok(m) => {
+                self.used_seed = seed;
                 self.model = Some(m);
                 self.applied = self.settings.restart_key();
                 self.dirty_pic = true;
@@ -1632,7 +1649,8 @@ impl Worker {
         let shown = self.shown_stats();
         json!({
             "settings": self.settings,
-            "needs_restart": m.is_some() && self.settings.restart_key() != self.applied,
+            "needs_restart": m.is_some() && self.needs_restart(),
+            "seed": m.map(|_| self.used_seed.to_string()),
             "kind": kind,
             "name": name,
             "ready": m.is_some(),
