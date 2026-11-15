@@ -48,12 +48,12 @@ computer from the last ten years has one.
 WHAT IS IN THIS FOLDER
 ----------------------
 
-primitive-gui     The browser program. Start this one.
-primitive-gpu     The same thing as a command-line program.
-                  Run it with no options to see how to use it.
+primitive-gui     The program. Start this one.
 ffmpeg, ffprobe   Used to read and write videos. These are separate
                   programs from the FFmpeg project, under the GPL
-                  licence (see FFMPEG-LICENSE.txt).
+                  licence (see FFMPEG-LICENSE.txt). On Windows, the
+                  .dll files and, on Linux, the "lib" folder belong
+                  to them. Keep them next to ffmpeg.
 LICENSE.txt       The licence of primitive-gpu (MIT).
 THIRD-PARTY-LICENSES.txt
                   The licences of the code libraries built

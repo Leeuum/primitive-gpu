@@ -8,7 +8,7 @@ A Rust port of Michael Fogleman's [primitive](https://github.com/fogleman/primit
 
 ## Download
 
-No install needed. Get the file for your computer from the [Releases page](https://github.com/Leeuum/primitive-gpu/releases/latest) (Windows, Mac with Apple Silicon, or Linux), unzip it, and double-click `primitive-gui`. The GUI opens in your browser. Close the small text window to stop it. ffmpeg comes included.
+No install needed. Get the file for your computer from the [Releases page](https://github.com/Leeuum/primitive-gpu/releases/latest) (Windows, Mac with Apple Silicon, or Linux), unzip it, and double-click `primitive-gui`. The GUI opens in your browser. Close the small text window to stop it. ffmpeg comes included. The download has only the GUI; to use the command-line program, build it yourself (see [Building](#building)).
 
 The first time, Windows and Mac warn you because the program is not signed:
 
@@ -49,6 +49,8 @@ cargo build --release
 The programs land in `rust/target/release/`. They use an `ffmpeg` placed next to them first, then the one on the system path.
 
 ## Command-line use
+
+The command-line program is not in the download. Build it as shown above.
 
 ```bash
 cd rust

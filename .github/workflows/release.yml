@@ -45,7 +45,7 @@ jobs:
           [[ "$ver" == v* ]] || ver="test"
           dir="primitive-gpu-$ver-${{ matrix.name }}"
           mkdir "$dir"
-          cp rust/target/release/primitive-gui${{ matrix.exe }} rust/target/release/primitive-gpu${{ matrix.exe }} "$dir"/
+          cp rust/target/release/primitive-gui${{ matrix.exe }} "$dir"/
           cp LICENSE "$dir/LICENSE.txt"
           cp packaging/START-HERE.txt "$dir"/
           echo "DIR=$dir" >> "$GITHUB_ENV"
@@ -59,19 +59,35 @@ jobs:
         run: cd rust && cargo about generate --locked about.hbs > "../$DIR/THIRD-PARTY-LICENSES.txt"
 
       # Ready-made ffmpeg builds that include the H.264 and VP9 encoders.
+      # The "shared" builds keep the code in libraries that ffmpeg and
+      # ffprobe both use, so the download carries it once instead of twice.
       - name: Add ffmpeg (Windows, Linux)
         if: runner.os != 'macOS'
         run: |
           kind=${{ runner.os == 'Windows' && 'win64' || 'linux64' }}
           ext=${{ runner.os == 'Windows' && 'zip' || 'tar.xz' }}
           asset=$(gh api repos/BtbN/FFmpeg-Builds/releases/latest --jq '.assets[].name' \
-            | grep -E "^ffmpeg-n[0-9.]+-latest-$kind-gpl-[0-9.]+\.$ext$" | sort -V | tail -1)
+            | grep -E "^ffmpeg-n[0-9.]+-latest-$kind-gpl-shared-[0-9.]+\.$ext$" | sort -V | tail -1)
           echo "Using $asset"
           gh release download latest -R BtbN/FFmpeg-Builds -p "$asset" -D ff
           cd ff
           if [ "$ext" = zip ]; then 7z x "$asset" > /dev/null; else tar -xf "$asset"; fi
           top=$(find . -mindepth 1 -maxdepth 1 -type d | head -1)
           cp "$top"/bin/ffmpeg${{ matrix.exe }} "$top"/bin/ffprobe${{ matrix.exe }} "../$DIR"/
+          if [ "${{ runner.os }}" = Windows ]; then
+            # Windows finds the DLLs next to the program.
+            cp "$top"/bin/*.dll "../$DIR"/
+          else
+            # The libraries go in lib/. Copy each under the name ffmpeg asks
+            # for (libavcodec.so.63 and so on), as a file, not a link.
+            mkdir "../$DIR/lib"
+            for f in "$top"/lib/*.so.*; do
+              if [[ "$f" =~ \.so\.[0-9]+$ ]]; then cp -L "$f" "../$DIR/lib"/; fi
+            done
+            # The build looks for its libraries in ../lib; point it at lib/ next to it.
+            sudo apt-get install -y -qq patchelf
+            for b in ffmpeg ffprobe; do patchelf --force-rpath --set-rpath '$ORIGIN/lib' "../$DIR/$b"; done
+          fi
           cp "$top"/LICENSE.txt "../$DIR/FFMPEG-LICENSE.txt"
           # The GPL asks for the source of this exact build: the FFmpeg commit it was made from, and the build scripts.
           version=$("../$DIR"/ffmpeg${{ matrix.exe }} -version | head -1)
@@ -109,6 +125,7 @@ jobs:
 
       - name: Check the bundled ffmpeg can make the videos the GUI makes
         run: |
+          "$DIR"/ffprobe${{ matrix.exe }} -hide_banner -version > /dev/null || { echo "ffprobe does not start"; exit 1; }
           for c in libx264 libvpx-vp9 libopus aac; do
             "$DIR"/ffmpeg${{ matrix.exe }} -hide_banner -encoders | grep -q " $c " || { echo "missing encoder $c"; exit 1; }
           done
