@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>primitive</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <main id="stage">
+    <div id="error" hidden><span id="error-text"></span><button id="error-close" title="Close">&times;</button></div>
+    <div id="view">
+      <img id="picture" alt="">
+      <img id="original" alt="" hidden>
+      <div id="drop-hint">
+        <div class="big">Drop an image, a video, or a folder of pictures here</div>
+        <div>or <button id="pick">choose files</button> <button id="pick-folder">choose a folder</button></div>
+        <div class="small">Pick several pictures to load them as an image sequence.</div>
+      </div>
+      <div id="busy" hidden><div id="busy-text"></div><div class="bar"><div id="busy-bar"></div></div></div>
+    </div>
+    <div id="controls">
+      <button id="play" disabled>Play</button>
+      <button id="pause-build" hidden title="Stop or go on with building new frames. Playback of the finished frames still works.">Pause building</button>
+      <span id="info"></span>
+      <span class="grow"></span>
+      <button id="hold-original" disabled title="Hold to see the original picture">Original</button>
+      <button id="open" title="Load another file">Open…</button>
+    </div>
+    <div id="timeline-row" hidden>
+      <canvas id="timeline" height="34"></canvas>
+      <span id="time"></span>
+    </div>
+    <div id="render-row" hidden></div>
+    <input type="file" id="file" accept="image/*,video/*,.gif,.heic" multiple hidden>
+    <input type="file" id="folder" webkitdirectory hidden>
+  </main>
+
+  <aside id="panel">
+    <div id="panel-head"><strong>PRIMITIVE</strong>
+      <span class="head-buttons">
+        <button id="settings-save" title="Save these settings to a file">Save</button>
+        <button id="settings-load" title="Load settings from a saved file">Load</button>
+      </span>
+      <input type="file" id="settings-file" accept=".json,application/json" hidden>
+    </div>
+    <div id="panel-body">
+    <details class="sec" open>
+      <summary>Shapes</summary>
+      <label>Mode
+        <select id="mode">
+          <option value="0">Combo (mix)</option>
+          <option value="1">Triangle</option>
+          <option value="2">Rectangle</option>
+          <option value="3">Ellipse</option>
+          <option value="4">Circle</option>
+          <option value="5">Rotated rectangle</option>
+          <option value="6">Curve</option>
+          <option value="7">Rotated ellipse</option>
+          <option value="8">Polygon</option>
+        </select>
+      </label>
+      <label>Shapes <input type="number" id="count" min="1" max="100000" step="10"></label>
+      <label>Alpha <span class="hint">0 = let it choose</span>
+        <span class="pair"><input type="range" id="alpha-range" min="0" max="255"><input type="number" id="alpha" min="0" max="255"></span>
+      </label>
+      <label>Extra shapes per step <input type="number" id="repeat" min="0" max="100"></label>
+    </details>
+
+    <details class="sec">
+      <summary>When to stop</summary>
+      <label>Stop at score <span class="hint">empty = off</span>
+        <input type="number" id="target_score" min="0" max="1" step="0.005" placeholder="off">
+      </label>
+      <label>Fewest shapes <span class="hint">used with Stop at score</span>
+        <input type="number" id="min_count" min="0" max="100000" step="10">
+      </label>
+    </details>
+
+    <details class="sec">
+      <summary>Look</summary>
+      <label>Background <span class="hint">empty = average color</span>
+        <span class="pair"><input type="text" id="background" placeholder="auto" maxlength="9"><input type="color" id="background-pick"></span>
+      </label>
+      <label>Score <span class="hint">restart to apply</span>
+        <select id="metric">
+          <option value="squared">Squared gaps (classic)</option>
+          <option value="plain">Plain gaps (bolder)</option>
+        </select>
+      </label>
+    </details>
+
+    <details class="sec" open>
+      <summary>Size</summary>
+      <label>Working size <span class="hint">restart to apply</span>
+        <span class="pair"><input type="range" id="work-range" min="64" max="1024" step="32"><input type="number" id="work_size" min="16" max="2048"></span>
+      </label>
+      <label>Output size
+        <select id="out_preset">
+          <option value="source">Same as source</option>
+          <option value="720">720p</option>
+          <option value="1080">1080p</option>
+          <option value="1440">1440p</option>
+          <option value="2160">4K</option>
+          <option value="custom">Custom…</option>
+        </select>
+      </label>
+      <div id="custom-size" class="pair" hidden>
+        <input type="number" id="out_w" min="16" max="16384" title="Width"> × <input type="number" id="out_h" min="16" max="16384" title="Height">
+      </div>
+      <div class="hint" id="out-dims"></div>
+    </details>
+
+    <details class="sec" id="video-mode" open hidden>
+      <summary>Video frames</summary>
+      <label class="radio"><input type="radio" name="frames" value="fresh"> start each frame fresh</label>
+      <label class="radio"><input type="radio" name="frames" value="build"> build on the previous frame</label>
+      <label class="radio" id="realtime-row" hidden><input type="checkbox" id="realtime"> build in real time</label>
+      <label id="fps-row" hidden>Frame rate (fps) <input type="number" id="seq_fps" min="1" max="240" step="any"></label>
+    </details>
+
+    <details class="sec">
+      <summary>Advanced search</summary>
+      <label>Chains <input type="number" id="chains" min="1" max="1024"></label>
+      <label>Random tries per chain <input type="number" id="random" min="1" max="100000"></label>
+      <label>Age (tries without gain) <input type="number" id="age" min="1" max="100000"></label>
+      <label>Mutations per round (k) <input type="number" id="k" min="1" max="1024"></label>
+      <label>Seed <span class="hint">empty = random; restart to apply</span><input type="text" id="seed" placeholder="random"></label>
+      <div class="hint" id="gpu"></div>
+      <button id="ask-reset" hidden>Show skipped warnings again</button>
+    </details>
+
+    <details class="sec" id="export-box" open>
+      <summary>Export</summary>
+      <label>File type <select id="export_fmt"></select></label>
+      <label>File name <input type="text" id="name_pattern" spellcheck="false"></label>
+      <div class="hint">Tags: <code>{name}</code> <code>{frame}</code> <code>{shapes}</code> <code>{mode}</code> <code>{date}</code> <code>{time}</code></div>
+      <div id="frame-opts" class="pair">
+        <label>Frame digits <input type="number" id="frame_digits" min="0" max="10"></label>
+        <label>First frame <input type="number" id="frame_start" min="0"></label>
+      </div>
+      <div class="hint" id="name-example"></div>
+    </details>
+    </div>
+
+    <div id="panel-foot">
+      <div id="actions">
+        <button id="restart" disabled>Restart</button>
+        <button id="render" class="primary" disabled>Render</button>
+      </div>
+      <div id="render-link"></div>
+    </div>
+  </aside>
+</div>
+<div id="tip" hidden></div>
+<dialog id="ask">
+  <form method="dialog">
+    <p id="ask-text"></p>
+    <label id="ask-skip-row" class="radio"><input type="checkbox" id="ask-skip"> Don't ask again</label>
+    <div class="ask-buttons">
+      <button value="no" id="ask-no">Cancel</button>
+      <button value="yes" id="ask-yes" class="primary">Go on</button>
+    </div>
+  </form>
+</dialog>
+<script src="app.js"></script>
+</body>
+</html>
