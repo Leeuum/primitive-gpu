@@ -39,7 +39,7 @@ impl Rng {
     #[inline]
     pub fn intn(&mut self, n: i32) -> i32 {
         debug_assert!(n > 0);
-        ((self.next_u64() >> 32) * n as u64 >> 32) as i32
+        (((self.next_u64() >> 32) * n as u64) >> 32) as i32
     }
 
     /// Uniform float in [0, 1).

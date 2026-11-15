@@ -387,7 +387,6 @@ pub struct Worker {
     /// Full size of the loaded picture or video, for "same as source".
     src_dims: (u32, u32),
     error: Option<String>,
-    error_id: u64,
     original_version: u64,
     status_tx: Arc<watch::Sender<String>>,
     original_tx: watch::Sender<Arc<Vec<u8>>>,
@@ -471,7 +470,6 @@ impl Worker {
             render_folder: false,
             src_dims: (0, 0),
             error: None,
-            error_id: 0,
             original_version: 0,
             status_tx,
             original_tx,
@@ -487,7 +485,6 @@ impl Worker {
         let m = msg.into();
         eprintln!("error: {m}");
         self.error = Some(m);
-        self.error_id += 1;
         self.dirty_status = true;
     }
 
@@ -1600,7 +1597,7 @@ impl Worker {
             let now = self.build_paused.filter(|_| self.building_paused()).unwrap_or_else(Instant::now);
             let el = now.saturating_duration_since(r.started).as_secs_f64();
             let eta = if done > 0 { Some(el / done as f64 * (n - r.next) as f64) } else { None };
-            json!({ "frame": r.next, "frames": n, "eta": eta, "elapsed": el })
+            json!({ "frame": r.next, "frames": n, "eta": eta })
         });
         let video = self.video().map(|v| {
             json!({
@@ -1609,7 +1606,6 @@ impl Worker {
                 "view": v.view,
                 "frontier": v.frontier,
                 "timeline": self.timeline(),
-                "has_audio": v.info.has_audio,
                 "sequence": v.files.is_some(),
             })
         });
@@ -1643,7 +1639,6 @@ impl Worker {
             "renders_dir": self.renders.display().to_string(),
             "name_example": self.name_example(),
             "error": self.error,
-            "error_id": self.error_id,
             "original": self.original_version,
             "video": video,
         })

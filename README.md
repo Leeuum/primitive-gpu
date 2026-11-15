@@ -102,7 +102,7 @@ The page works from any device on the same network.
 - **Videos:** every loop adds more shapes to each frame. Each frame can start fresh or build on the one before.
 - **Render:** saves an MP4 or WebM (with the original sound), a GIF, or an image sequence to `primitive` in your Videos folder (Movies on a Mac). Existing files are never overwritten.
 
-**Security:** the GUI has no password and listens on all network interfaces. Never expose its port to the internet.
+**Security:** the GUI has no password and listens on all network interfaces. Never expose its port to the internet. To report a security problem, see [SECURITY.md](SECURITY.md).
 
 ## Testing and adding shapes
 
@@ -114,9 +114,14 @@ cd rust
 
 To add a shape, add a variant to the `Shape` enum in `rust/src/shapes.rs`, handle it in each of its methods, add a matching `walk_*` function to `rust/src/raster_score.wgsl`, and run `./check.sh`.
 
+## Maintainer
+
+Maintained by [Leeuum](https://github.com/Leeuum) in spare time, so replies can be slow. Bug reports and ideas are welcome as [issues](https://github.com/Leeuum/primitive-gpu/issues).
+
 ## Credits
 
-- **Michael Fogleman** created the original [primitive](https://github.com/fogleman/primitive) algorithm and Go program (MIT licence). This port follows its design, flags and shape modes, and uses its example pictures.
+- **Michael Fogleman** created the original [primitive](https://github.com/fogleman/primitive) algorithm and Go program (MIT licence). This port follows its design, flags and shape modes.
+- The example pictures are public domain or CC0. See [examples/CREDITS.md](examples/CREDITS.md).
 - Written with **Claude**, using [Claude Code](https://claude.com/claude-code).
 
 ## Licence

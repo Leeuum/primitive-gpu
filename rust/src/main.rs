@@ -113,11 +113,11 @@ fn parse_args() -> Args {
         match name.as_str() {
             "h" | "help" => usage(),
             "check" => {
-                a.search.check = inline.as_deref().map_or(true, |v| v == "true" || v == "1");
+                a.search.check = inline.as_deref().is_none_or(|v| v == "true" || v == "1");
                 continue;
             }
             "v" | "vv" => {
-                let on = inline.as_deref().map_or(true, |v| v == "true" || v == "1");
+                let on = inline.as_deref().is_none_or(|v| v == "true" || v == "1");
                 if on {
                     a.log = a.log.max(if name == "v" { 1 } else { 2 });
                 }
@@ -366,7 +366,7 @@ fn main() {
                         .unwrap_or_default()
                 };
                 let percent = output.contains('%');
-                let save_frames = percent && ext != ".gif" && frame % args.nth == 0;
+                let save_frames = percent && ext != ".gif" && frame.is_multiple_of(args.nth);
                 let last = reached || (j == nconf - 1 && i == config.count - 1);
                 if save_frames || last {
                     let path = if percent { frame_path(output, frame) } else { output.clone() };

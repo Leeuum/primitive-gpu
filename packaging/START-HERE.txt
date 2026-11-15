@@ -55,3 +55,6 @@ ffmpeg, ffprobe   Used to read and write videos. These are separate
                   programs from the FFmpeg project, under the GPL
                   licence (see FFMPEG-LICENSE.txt).
 LICENSE.txt       The licence of primitive-gpu (MIT).
+THIRD-PARTY-LICENSES.txt
+                  The licences of the code libraries built
+                  into the programs.

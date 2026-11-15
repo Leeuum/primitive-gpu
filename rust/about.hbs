@@ -1,0 +1,18 @@
+THIRD-PARTY LICENCES
+====================
+
+primitive-gpu and primitive-gui are built from the open-source Rust
+libraries listed below. Each licence text is followed by the libraries
+that use it.
+
+ffmpeg and ffprobe are separate programs; see FFMPEG-LICENSE.txt.
+
+{{#each licenses}}
+
+------------------------------------------------------------------------
+{{{name}}}
+Used by: {{#each used_by}}{{{crate.name}}} {{{crate.version}}}{{#unless @last}}, {{/unless}}{{/each}}
+------------------------------------------------------------------------
+
+{{{text}}}
+{{/each}}

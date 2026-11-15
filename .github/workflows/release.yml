@@ -30,7 +30,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -50,6 +50,14 @@ jobs:
           cp packaging/START-HERE.txt "$dir"/
           echo "DIR=$dir" >> "$GITHUB_ENV"
 
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+
+      # The MIT and Apache licences of the libraries ask for their text to ship with the program.
+      - name: Add the licences of the Rust libraries
+        run: cd rust && cargo about generate --locked about.hbs > "../$DIR/THIRD-PARTY-LICENSES.txt"
+
       # Ready-made ffmpeg builds that include the H.264 and VP9 encoders.
       - name: Add ffmpeg (Windows, Linux)
         if: runner.os != 'macOS'
@@ -65,8 +73,16 @@ jobs:
           top=$(find . -mindepth 1 -maxdepth 1 -type d | head -1)
           cp "$top"/bin/ffmpeg${{ matrix.exe }} "$top"/bin/ffprobe${{ matrix.exe }} "../$DIR"/
           cp "$top"/LICENSE.txt "../$DIR/FFMPEG-LICENSE.txt"
-          echo "FFmpeg build from https://github.com/BtbN/FFmpeg-Builds ($asset)." >> "../$DIR/FFMPEG-LICENSE.txt"
-          echo "FFmpeg source code: https://ffmpeg.org/download.html" >> "../$DIR/FFMPEG-LICENSE.txt"
+          # The GPL asks for the source of this exact build: the FFmpeg commit it was made from, and the build scripts.
+          version=$("../$DIR"/ffmpeg${{ matrix.exe }} -version | head -1)
+          commit=$(grep -oE -- '-g[0-9a-f]{7,}' <<<"$version" | head -1 | cut -c3-)
+          {
+            echo ""
+            echo "FFmpeg build from https://github.com/BtbN/FFmpeg-Builds ($asset)."
+            echo "Version: $version"
+            if [ -n "$commit" ]; then echo "FFmpeg source code: https://github.com/FFmpeg/FFmpeg/commit/$commit"; fi
+            echo "Build scripts and the versions of the libraries inside: https://github.com/BtbN/FFmpeg-Builds"
+          } >> "../$DIR/FFMPEG-LICENSE.txt"
 
       - name: Add ffmpeg (Mac)
         if: runner.os == 'macOS'
@@ -81,8 +97,15 @@ jobs:
           cp ffmpeg ffprobe "../$DIR"/
           curl -sfL -o "../$DIR/FFMPEG-LICENSE.txt" https://www.gnu.org/licenses/gpl-3.0.txt
           echo "" >> "../$DIR/FFMPEG-LICENSE.txt"
-          echo "FFmpeg build from https://ffmpeg.martin-riedl.de ($url)." >> "../$DIR/FFMPEG-LICENSE.txt"
-          echo "FFmpeg source code: https://ffmpeg.org/download.html" >> "../$DIR/FFMPEG-LICENSE.txt"
+          # The GPL asks for the source of this exact build: the FFmpeg release it was made from, and the build scripts.
+          version=$(./ffmpeg -version | head -1)
+          release=$(awk '{print $3}' <<<"$version")
+          {
+            echo "FFmpeg build from https://ffmpeg.martin-riedl.de ($url)."
+            echo "Version: $version"
+            if [[ "$release" =~ ^[0-9.]+$ ]]; then echo "FFmpeg source code: https://ffmpeg.org/releases/ffmpeg-$release.tar.xz"; fi
+            echo "Build scripts and the versions of the libraries inside: https://git.martin-riedl.de/ffmpeg/build-script"
+          } >> "../$DIR/FFMPEG-LICENSE.txt"
 
       - name: Check the bundled ffmpeg can make the videos the GUI makes
         run: |
@@ -100,7 +123,7 @@ jobs:
             zip -qry "$DIR.zip" "$DIR" && echo "FILE=$DIR.zip" >> "$GITHUB_ENV"
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
           path: ${{ env.FILE }}
@@ -112,7 +135,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: files
           merge-multiple: true

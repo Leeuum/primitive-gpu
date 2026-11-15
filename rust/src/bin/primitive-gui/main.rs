@@ -184,9 +184,7 @@ async fn serve(port: u16, open: bool) {
                     .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
                     .unwrap_or_else(|| "unknown error".into());
                 let status = serde_json::json!({
-                    "crashed": true,
                     "error": format!("The worker stopped with an error: {msg}. Restart primitive-gui."),
-                    "error_id": u64::MAX,
                     "settings": Settings::default(),
                 });
                 status_tx.send_replace(status.to_string());

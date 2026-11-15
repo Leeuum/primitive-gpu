@@ -485,15 +485,6 @@ impl Model {
         self.load_shapes(&shapes, &colors, &scores);
     }
 
-    /// Redraw the stored shapes on the background color with a long side of
-    /// `size` pixels.
-    pub fn render_at(&self, size: u32) -> Pixmap {
-        let (sw, sh, scale) = output_size(self.w, self.h, size);
-        let mut pm = blank_canvas(sw.max(1), sh.max(1), self.bg);
-        draw_shapes(&mut pm, &self.shapes, &self.colors, scale);
-        pm
-    }
-
     /// GPU-drawing path: make several batches in one go and join them into
     /// one batch for a single GPU job (see `make_cands`). Each batch gets its
     /// own seed.
@@ -780,10 +771,7 @@ impl Model {
         }
         let k = self.cfg.k.max(1);
         let groups = SLOTS.min(chains.len());
-        let mut pending: Vec<Option<(Vec<usize>, Vec<State>)>> = (0..groups).map(|_| None).collect();
-        for g in 0..groups {
-            pending[g] = self.climb_round(chains, g, groups);
-        }
+        let mut pending: Vec<_> = (0..groups).map(|g| self.climb_round(chains, g, groups)).collect();
         loop {
             let mut any = false;
             for g in 0..groups {

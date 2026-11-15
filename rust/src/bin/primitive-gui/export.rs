@@ -8,7 +8,7 @@ use primitive_gpu::load;
 use primitive_gpu::model;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -210,7 +210,6 @@ fn timelapse(d: &ExportData, tmp: &Path, container: &str) -> Result<Vec<u8>, Str
         }
         res = write(&pm);
     }
-    drop(write);
     drop(stdin);
     let fin = video::finish_encode(child);
     res.and(fin)?;
@@ -241,7 +240,7 @@ impl FileWriter {
         let error = Arc::new(Mutex::new(None));
         let threads = (0..3)
             .map(|_| {
-                let (rx, error): (Arc<Mutex<Receiver<(PathBuf, Payload)>>>, _) = (rx.clone(), error.clone());
+                let (rx, error) = (rx.clone(), error.clone());
                 std::thread::spawn(move || loop {
                     let job = rx.lock().unwrap().recv();
                     let Ok((path, payload)) = job else { return };

@@ -73,7 +73,7 @@ fn keep_factor(sa: u32, ma: u32) -> u32 {
 /// One blended channel: old value `d`, source channel `s`.
 /// common.wgsl: `o` in visit.
 fn blend_channel(d: u32, s: u32, keep: u32, ma: u32) -> u8 {
-    ((d * keep + s * ma) / M >> 8) as u8
+    (((d * keep + s * ma) / M) >> 8) as u8
 }
 
 /// Best color for a shape. Returns [r, g, b, a].
