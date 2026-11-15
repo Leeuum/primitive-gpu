@@ -1,5 +1,5 @@
 # Builds the download for Windows, Mac and Linux when a version tag
-# (for example v0.1.0) is pushed, and puts the three files in a draft
+# (for example v0.1.0) is pushed, and puts the files in a draft
 # release. Nothing is public until the draft is published by hand.
 # "Run workflow" on the Actions page builds the files without a release.
 name: release
@@ -57,6 +57,11 @@ jobs:
       # The MIT and Apache licences of the libraries ask for their text to ship with the program.
       - name: Add the licences of the Rust libraries
         run: cd rust && cargo about generate --locked about.hbs > "../$DIR/THIRD-PARTY-LICENSES.txt"
+
+      # The small download: the same folder without ffmpeg, for people who
+      # have ffmpeg installed or only use pictures.
+      - name: Make the small folder
+        run: cp -r "$DIR" "$DIR-no-ffmpeg"
 
       # Ready-made ffmpeg builds that include the H.264 and VP9 encoders.
       # The "shared" builds keep the code in libraries that ffmpeg and
@@ -132,18 +137,25 @@ jobs:
 
       - name: Pack
         run: |
-          if [ "${{ runner.os }}" = Linux ]; then
-            tar -czf "$DIR.tar.gz" "$DIR" && echo "FILE=$DIR.tar.gz" >> "$GITHUB_ENV"
-          elif [ "${{ runner.os }}" = Windows ]; then
-            7z a -tzip "$DIR.zip" "$DIR" > /dev/null && echo "FILE=$DIR.zip" >> "$GITHUB_ENV"
-          else
-            zip -qry "$DIR.zip" "$DIR" && echo "FILE=$DIR.zip" >> "$GITHUB_ENV"
-          fi
+          for d in "$DIR" "$DIR-no-ffmpeg"; do
+            if [ "${{ runner.os }}" = Linux ]; then
+              tar -czf "$d.tar.gz" "$d"
+            elif [ "${{ runner.os }}" = Windows ]; then
+              7z a -tzip "$d.zip" "$d" > /dev/null
+            else
+              zip -qry "$d.zip" "$d"
+            fi
+          done
 
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
-          path: ${{ env.FILE }}
+          path: |
+            ${{ env.DIR }}.zip
+            ${{ env.DIR }}.tar.gz
+            ${{ env.DIR }}-no-ffmpeg.zip
+            ${{ env.DIR }}-no-ffmpeg.tar.gz
+          if-no-files-found: error
 
   release:
     needs: build
@@ -160,4 +172,4 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" files/* -R "$GITHUB_REPOSITORY" --draft \
             --title "primitive-gpu $GITHUB_REF_NAME" \
-            --notes "Download the file for your computer, unzip it, and double-click primitive-gui. Read START-HERE.txt inside for the one-time security step on Windows and Mac."
+            --notes "Download the file for your computer, unzip it, and double-click primitive-gui. Read START-HERE.txt inside for the one-time security step on Windows and Mac. The files ending in no-ffmpeg are much smaller and leave out ffmpeg. They work for pictures. For videos, GIFs and HEIC photos, they need ffmpeg installed on your computer. If you are not sure, take the full download."

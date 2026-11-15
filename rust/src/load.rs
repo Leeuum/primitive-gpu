@@ -12,7 +12,19 @@ use tiny_skia::Pixmap;
 pub fn open_image(path: &str) -> Result<DynamicImage, String> {
     match open_with_image_crate(path) {
         Ok(img) => Ok(img),
-        Err(first) => open_with_ffmpeg(path).map_err(|_| format!("{path}: {first}")),
+        Err(first) => open_with_ffmpeg(path).map_err(|e| if e == NO_FFMPEG { e } else { format!("{path}: {first}") }),
+    }
+}
+
+/// The error when ffmpeg or ffprobe is not found (the small download has neither).
+pub const NO_FFMPEG: &str = "This needs ffmpeg, which is not installed. Get the full download, which includes it, or install ffmpeg.";
+
+/// Turns a failure to start `name` into an error message.
+pub fn run_error(name: &str, e: std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        NO_FFMPEG.to_string()
+    } else {
+        format!("could not run {name}: {e}")
     }
 }
 
@@ -44,7 +56,7 @@ fn open_with_ffmpeg(path: &str) -> Result<DynamicImage, String> {
     let out = tool("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-i", path, "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"])
         .output()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| run_error("ffmpeg", e))?;
     if !out.status.success() || out.stdout.is_empty() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }

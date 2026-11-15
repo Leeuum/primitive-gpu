@@ -54,6 +54,10 @@ ffmpeg, ffprobe   Used to read and write videos. These are separate
                   licence (see FFMPEG-LICENSE.txt). On Windows, the
                   .dll files and, on Linux, the "lib" folder belong
                   to them. Keep them next to ffmpeg.
+                  The small "no-ffmpeg" download leaves them out.
+                  Pictures still work. For videos, GIFs and HEIC
+                  photos, install ffmpeg on your computer, or get
+                  the full download.
 LICENSE.txt       The licence of primitive-gpu (MIT).
 THIRD-PARTY-LICENSES.txt
                   The licences of the code libraries built

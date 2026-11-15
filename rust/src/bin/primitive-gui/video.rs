@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 use std::path::Path;
-use primitive_gpu::load::tool;
+use primitive_gpu::load::{run_error, tool};
 use std::process::{Child, ChildStdin, Stdio};
 
 /// What ffprobe says about a video, with the size after ffmpeg turns a
@@ -31,7 +31,7 @@ pub fn probe(path: &Path) -> Result<Option<VideoInfo>, String> {
         .args(["-v", "error", "-show_streams", "-show_format", "-of", "json"])
         .arg(path)
         .output()
-        .map_err(|e| format!("could not run ffprobe: {e}"))?;
+        .map_err(|e| run_error("ffprobe", e))?;
     if !out.status.success() {
         return Ok(None);
     }
@@ -99,7 +99,7 @@ pub fn start_decode(input: &Path, info: &VideoInfo, w: u32, h: u32, out: &Path) 
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("could not run ffmpeg: {e}"))
+        .map_err(|e| run_error("ffmpeg", e))
 }
 
 /// Starts a video encoder that reads raw RGBA frames of `w` x `h` (both
@@ -121,7 +121,7 @@ pub fn start_encode(w: u32, h: u32, fps_text: &str, out: &Path, container: &str)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("could not run ffmpeg: {e}"))?;
+        .map_err(|e| run_error("ffmpeg", e))?;
     let stdin = child.stdin.take().ok_or("ffmpeg has no input pipe")?;
     Ok((child, stdin))
 }
@@ -154,7 +154,7 @@ pub fn add_sound(video: &Path, original: &Path, out: &Path, container: &str) -> 
             .args(if container == "mp4" { &["-movflags", "+faststart"][..] } else { &[][..] })
             .arg(out)
             .output()
-            .map_err(|e| format!("could not run ffmpeg: {e}"))?;
+            .map_err(|e| run_error("ffmpeg", e))?;
         if st.status.success() {
             return Ok(());
         }
