@@ -32,12 +32,7 @@ pub fn mode_name(mode: i32) -> &'static str {
 }
 
 fn date_text(fmt: &str) -> String {
-    std::process::Command::new("date")
-        .arg(fmt)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
+    chrono::Local::now().format(fmt).to_string()
 }
 
 /// Turns the user's name pattern into file names. Tags: {name} {frame}
@@ -64,8 +59,8 @@ impl Naming {
             name: if stem.is_empty() { "picture".into() } else { stem },
             shapes,
             mode,
-            date: date_text("+%Y-%m-%d"),
-            time: date_text("+%H-%M-%S"),
+            date: date_text("%Y-%m-%d"),
+            time: date_text("%H-%M-%S"),
         }
     }
 

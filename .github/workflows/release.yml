@@ -1,0 +1,123 @@
+# Builds the download for Windows, Mac and Linux when a version tag
+# (for example v0.1.0) is pushed, and puts the three files in a draft
+# release. Nothing is public until the draft is published by hand.
+# "Run workflow" on the Actions page builds the files without a release.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: github.repository == 'Leeuum/primitive-gpu'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, name: windows-x64, exe: .exe }
+          - { os: macos-latest, name: mac-arm64, exe: "" }
+          # The oldest supported Ubuntu, so the program runs on older Linux too.
+          - { os: ubuntu-22.04, name: linux-x64, exe: "" }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Build
+        run: cd rust && cargo build --release --locked
+
+      - name: Make the folder
+        run: |
+          ver="${GITHUB_REF_NAME}"
+          [[ "$ver" == v* ]] || ver="test"
+          dir="primitive-gpu-$ver-${{ matrix.name }}"
+          mkdir "$dir"
+          cp rust/target/release/primitive-gui${{ matrix.exe }} rust/target/release/primitive-gpu${{ matrix.exe }} "$dir"/
+          cp LICENSE "$dir/LICENSE.txt"
+          cp packaging/START-HERE.txt "$dir"/
+          echo "DIR=$dir" >> "$GITHUB_ENV"
+
+      # Ready-made ffmpeg builds that include the H.264 and VP9 encoders.
+      - name: Add ffmpeg (Windows, Linux)
+        if: runner.os != 'macOS'
+        run: |
+          kind=${{ runner.os == 'Windows' && 'win64' || 'linux64' }}
+          ext=${{ runner.os == 'Windows' && 'zip' || 'tar.xz' }}
+          asset=$(gh api repos/BtbN/FFmpeg-Builds/releases/latest --jq '.assets[].name' \
+            | grep -E "^ffmpeg-n[0-9.]+-latest-$kind-gpl-[0-9.]+\.$ext$" | sort -V | tail -1)
+          echo "Using $asset"
+          gh release download latest -R BtbN/FFmpeg-Builds -p "$asset" -D ff
+          cd ff
+          if [ "$ext" = zip ]; then 7z x "$asset" > /dev/null; else tar -xf "$asset"; fi
+          top=$(find . -mindepth 1 -maxdepth 1 -type d | head -1)
+          cp "$top"/bin/ffmpeg${{ matrix.exe }} "$top"/bin/ffprobe${{ matrix.exe }} "../$DIR"/
+          cp "$top"/LICENSE.txt "../$DIR/FFMPEG-LICENSE.txt"
+          echo "FFmpeg build from https://github.com/BtbN/FFmpeg-Builds ($asset)." >> "../$DIR/FFMPEG-LICENSE.txt"
+          echo "FFmpeg source code: https://ffmpeg.org/download.html" >> "../$DIR/FFMPEG-LICENSE.txt"
+
+      - name: Add ffmpeg (Mac)
+        if: runner.os == 'macOS'
+        run: |
+          url=$(curl -sIL -o /dev/null -w '%{url_effective}' https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip)
+          echo "Using $url"
+          mkdir ff && cd ff
+          curl -sfL -o ffmpeg.zip "$url"
+          curl -sfL -o ffprobe.zip "${url%ffmpeg.zip}ffprobe.zip"
+          unzip -q ffmpeg.zip && unzip -q ffprobe.zip
+          chmod +x ffmpeg ffprobe
+          cp ffmpeg ffprobe "../$DIR"/
+          curl -sfL -o "../$DIR/FFMPEG-LICENSE.txt" https://www.gnu.org/licenses/gpl-3.0.txt
+          echo "" >> "../$DIR/FFMPEG-LICENSE.txt"
+          echo "FFmpeg build from https://ffmpeg.martin-riedl.de ($url)." >> "../$DIR/FFMPEG-LICENSE.txt"
+          echo "FFmpeg source code: https://ffmpeg.org/download.html" >> "../$DIR/FFMPEG-LICENSE.txt"
+
+      - name: Check the bundled ffmpeg can make the videos the GUI makes
+        run: |
+          for c in libx264 libvpx-vp9 libopus aac; do
+            "$DIR"/ffmpeg${{ matrix.exe }} -hide_banner -encoders | grep -q " $c " || { echo "missing encoder $c"; exit 1; }
+          done
+
+      - name: Pack
+        run: |
+          if [ "${{ runner.os }}" = Linux ]; then
+            tar -czf "$DIR.tar.gz" "$DIR" && echo "FILE=$DIR.tar.gz" >> "$GITHUB_ENV"
+          elif [ "${{ runner.os }}" = Windows ]; then
+            7z a -tzip "$DIR.zip" "$DIR" > /dev/null && echo "FILE=$DIR.zip" >> "$GITHUB_ENV"
+          else
+            zip -qry "$DIR.zip" "$DIR" && echo "FILE=$DIR.zip" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ env.FILE }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: files
+          merge-multiple: true
+      - name: Make a draft release
+        run: |
+          gh release create "$GITHUB_REF_NAME" files/* -R "$GITHUB_REPOSITORY" --draft \
+            --title "primitive-gpu $GITHUB_REF_NAME" \
+            --notes "Download the file for your computer, unzip it, and double-click primitive-gui. Read START-HERE.txt inside for the one-time security step on Windows and Mac."

@@ -27,8 +27,21 @@ fn open_with_image_crate(path: &str) -> Result<DynamicImage, String> {
     Ok(img)
 }
 
+/// A command for ffmpeg or ffprobe. A copy next to this program (the
+/// download bundles one) comes first; otherwise the one on the system path.
+pub fn tool(name: &str) -> Command {
+    let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        let local = dir.join(&file);
+        if local.is_file() {
+            return Command::new(local);
+        }
+    }
+    Command::new(file)
+}
+
 fn open_with_ffmpeg(path: &str) -> Result<DynamicImage, String> {
-    let out = Command::new("ffmpeg")
+    let out = tool("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-i", path, "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"])
         .output()
         .map_err(|e| e.to_string())?;

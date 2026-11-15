@@ -553,7 +553,7 @@ function render() {
   const link = $("render-link");
   if (st.render_file && st.render_folder) {
     link.innerHTML = "";
-    link.append(`Done. Saved in ~/Videos/primitive/${st.render_file}/`, document.createElement("br"));
+    link.append(`Done. Saved in ${st.renders_dir}/${st.render_file}/`, document.createElement("br"));
     const a = document.createElement("a");
     a.href = `/zip/${encodeURIComponent(st.render_file)}`;
     a.textContent = "Download as a zip file";
@@ -570,7 +570,7 @@ function render() {
     link.append("Done. ", a, document.createElement("br"));
     const where = document.createElement("span");
     where.className = "hint";
-    where.textContent = "Also saved in ~/Videos/primitive/";
+    where.textContent = `Also saved in ${st.renders_dir}`;
     link.append(where);
     if (myRender && downloaded !== st.render_file) {
       downloaded = st.render_file;

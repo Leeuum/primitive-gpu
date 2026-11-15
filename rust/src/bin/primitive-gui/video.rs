@@ -2,7 +2,8 @@
 
 use serde_json::Value;
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use primitive_gpu::load::tool;
+use std::process::{Child, ChildStdin, Stdio};
 
 /// What ffprobe says about a video, with the size after ffmpeg turns a
 /// sideways phone video upright.
@@ -26,7 +27,7 @@ fn rational(s: &str) -> Option<f64> {
 /// Returns `Ok(None)` when the file is a still picture (or ffprobe cannot
 /// read it), and the video facts when it has at least two frames.
 pub fn probe(path: &Path) -> Result<Option<VideoInfo>, String> {
-    let out = Command::new("ffprobe")
+    let out = tool("ffprobe")
         .args(["-v", "error", "-show_streams", "-show_format", "-of", "json"])
         .arg(path)
         .output()
@@ -89,7 +90,7 @@ pub fn fit(width: u32, height: u32, size: u32) -> (u32, u32) {
 /// Starts decoding every frame at a fixed frame rate and the working size,
 /// as raw RGBA into `out`.
 pub fn start_decode(input: &Path, info: &VideoInfo, w: u32, h: u32, out: &Path) -> Result<Child, String> {
-    Command::new("ffmpeg")
+    tool("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
         .arg(input)
         .args(["-an", "-vf", &format!("fps={},scale={w}:{h}:flags=area", info.fps_text)])
@@ -111,7 +112,7 @@ pub fn start_encode(w: u32, h: u32, fps_text: &str, out: &Path, container: &str)
         "gif" => &["-vf", "split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=sierra2_4a", "-loop", "0"],
         _ => &["-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
     };
-    let mut child = Command::new("ffmpeg")
+    let mut child = tool("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgba"])
         .args(["-s", &format!("{w}x{h}"), "-framerate", fps_text, "-i", "-"])
         .args(codec)
@@ -142,7 +143,7 @@ pub fn add_sound(video: &Path, original: &Path, out: &Path, container: &str) -> 
     let mut last = String::new();
     let fallback = if container == "webm" { ["-c:a", "libopus", "-b:a", "160k"] } else { ["-c:a", "aac", "-b:a", "192k"] };
     for audio in [["-c:a", "copy", "", ""], fallback] {
-        let st = Command::new("ffmpeg")
+        let st = tool("ffmpeg")
             .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
             .arg(video)
             .arg("-i")

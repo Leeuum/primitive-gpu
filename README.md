@@ -6,6 +6,17 @@ A Rust port of Michael Fogleman's [primitive](https://github.com/fogleman/primit
 
 ![The browser GUI building a video frame by frame with rotated rectangles](docs/images/gui.jpg)
 
+## Download
+
+No install needed. Get the file for your computer from the [Releases page](https://github.com/Leeuum/primitive-gpu/releases/latest) (Windows, Mac with Apple Silicon, or Linux), unzip it, and double-click `primitive-gui`. The GUI opens in your browser. Close the small text window to stop it. ffmpeg comes included.
+
+The first time, Windows and Mac warn you because the program is not signed:
+
+- **Windows:** click "More info", then "Run anyway".
+- **Mac:** click "Done", then open System Settings > Privacy & Security and click "Open Anyway".
+
+`START-HERE.txt` in the download explains the rest.
+
 ## How it works
 
 The canvas starts as the average colour of the target. The program finds the shape that brings the canvas closest to the target, adds it, and repeats. To find each shape:
@@ -28,14 +39,14 @@ Average time for 50 shapes at a 256-pixel working size (Ryzen 7 2700, RTX 2060):
 
 ## Building
 
-You need [Rust](https://rustup.rs), a graphics card with Vulkan, Metal or DirectX 12, and [ffmpeg](https://ffmpeg.org) for videos and formats such as HEIC.
+To build it yourself, you need [Rust](https://rustup.rs), a graphics card with Vulkan, Metal or DirectX 12, and [ffmpeg](https://ffmpeg.org) for videos and formats such as HEIC.
 
 ```bash
 cd rust
 cargo build --release
 ```
 
-The programs land in `rust/target/release/`. Tested on Linux; the GUI may need small changes for Windows.
+The programs land in `rust/target/release/`. They use an `ffmpeg` placed next to them first, then the one on the system path.
 
 ## Command-line use
 
@@ -79,8 +90,8 @@ GIF output animates the shapes being added. With `%d` in a PNG, JPG or SVG name,
 
 ```bash
 cd rust
-target/release/primitive-gui            # then open http://localhost:8640
-target/release/primitive-gui -port 9000 -j 8
+target/release/primitive-gui            # opens http://localhost:8640 in the browser
+target/release/primitive-gui -port 9000 -j 8 -no-open
 ```
 
 The page works from any device on the same network.
@@ -89,7 +100,7 @@ The page works from any device on the same network.
 - **Stopping:** "Shapes" sets the most shapes per picture, "Stop at score" stops once it is close enough, and "Fewest shapes" keeps dark frames from stopping too soon.
 - **Export:** PNG, JPG, SVG or a timelapse, at any size up to 4K without a new search.
 - **Videos:** every loop adds more shapes to each frame. Each frame can start fresh or build on the one before.
-- **Render:** saves an MP4 or WebM (with the original sound), a GIF, or an image sequence to `~/Videos/primitive/`. Existing files are never overwritten.
+- **Render:** saves an MP4 or WebM (with the original sound), a GIF, or an image sequence to `primitive` in your Videos folder (Movies on a Mac). Existing files are never overwritten.
 
 **Security:** the GUI has no password and listens on all network interfaces. Never expose its port to the internet.
 

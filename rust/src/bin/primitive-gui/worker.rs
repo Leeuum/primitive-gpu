@@ -1640,6 +1640,7 @@ impl Worker {
             "render": render,
             "render_file": self.render_file,
             "render_folder": self.render_folder,
+            "renders_dir": self.renders.display().to_string(),
             "name_example": self.name_example(),
             "error": self.error,
             "error_id": self.error_id,

@@ -46,10 +46,11 @@ impl App {
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: primitive-gui [-port N] [-j N]
+        "Usage: primitive-gui [-port N] [-j N] [-no-open]
 
   -port <n>   port to listen on (default 8640)
   -j <n>      CPU threads (default: all cores)
+  -no-open    do not open the page in a browser
 
 Open http://<this computer>:<port> in a browser."
     );
@@ -59,9 +60,15 @@ Open http://<this computer>:<port> in a browser."
 fn main() {
     let mut port: u16 = 8640;
     let mut threads: usize = 0;
+    let mut open = true;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
+        if args[i].trim_start_matches('-') == "no-open" {
+            open = false;
+            i += 1;
+            continue;
+        }
         let next = |i: usize| args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
         match args[i].trim_start_matches('-') {
             "port" => port = next(i) as u16,
@@ -73,14 +80,71 @@ fn main() {
     if threads > 0 {
         let _ = rayon::ThreadPoolBuilder::new().num_threads(threads).build_global();
     }
-    tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio").block_on(serve(port));
+    tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio").block_on(serve(port, open));
 }
 
-async fn serve(port: u16) {
+/// Opens the page in the default browser, but only when someone sits at
+/// this computer (not over SSH, and on Linux only with a desktop).
+fn open_browser(url: &str) {
+    if std::env::var_os("SSH_CONNECTION").is_some() {
+        return;
+    }
+    #[cfg(target_os = "windows")]
+    let r = std::process::Command::new("explorer").arg(url).spawn();
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let r = {
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            return;
+        }
+        std::process::Command::new("xdg-open").arg(url).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn()
+    };
+    if r.is_err() {
+        println!("Could not open a browser. Open {url} yourself.");
+    }
+}
+
+/// This computer's address on the home network. Connecting a UDP socket
+/// sends nothing; it only makes the system pick the outgoing address.
+fn lan_address() -> Option<std::net::IpAddr> {
+    let s = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    s.connect(("192.168.0.1", 9)).ok()?;
+    let ip = s.local_addr().ok()?.ip();
+    (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+}
+
+/// Where renders are saved: the user's Videos folder (Movies on a Mac).
+fn renders_folder() -> PathBuf {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    home.join(if cfg!(target_os = "macos") { "Movies" } else { "Videos" }).join("primitive")
+}
+
+/// A Mac marks every file from a downloaded zip as "from the internet" and
+/// refuses to run the bundled ffmpeg and ffprobe. The user has already
+/// allowed this program, so it clears the mark on its two helpers.
+#[cfg(target_os = "macos")]
+fn allow_helpers() {
+    let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) else { return };
+    for name in ["ffmpeg", "ffprobe"] {
+        let p = dir.join(name);
+        if p.is_file() {
+            let _ = std::process::Command::new("xattr").args(["-d", "com.apple.quarantine"]).arg(&p).stderr(std::process::Stdio::null()).status();
+        }
+    }
+}
+
+async fn serve(port: u16, open: bool) {
+    #[cfg(target_os = "macos")]
+    allow_helpers();
+    let url = format!("http://localhost:{port}");
     let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            eprintln!("Port {port} is in use: primitive-gui is probably already running. Open http://localhost:{port}");
+            eprintln!("Port {port} is in use: primitive-gui is probably already running. Open {url}");
+            if open {
+                open_browser(&url);
+            }
             std::process::exit(3);
         }
         Err(e) => {
@@ -93,8 +157,8 @@ async fn serve(port: u16) {
     let tmp = std::env::temp_dir().join("primitive-gui");
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).expect("could not make the temp folder");
-    let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
-    let renders = home.join("Videos").join("primitive");
+    let renders = renders_folder();
+    let renders_text = renders.display().to_string();
 
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (status_tx, status_rx) = watch::channel(String::from("{}"));
@@ -152,26 +216,23 @@ async fn serve(port: u16) {
         .route("/zip/{name}", get(zip_download))
         .with_state(app.clone());
 
-    let host = std::process::Command::new("hostname").arg("-I").output().ok().and_then(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().map(|s| s.to_string()));
     println!("primitive-gui is running. Open one of these in a browser:");
-    println!("  http://localhost:{port}");
-    if let Some(h) = host.filter(|h| !h.is_empty()) {
-        println!("  http://{h}:{port}   (phone or laptop)");
+    println!("  {url}");
+    if let Some(ip) = lan_address() {
+        println!("  http://{ip}:{port}   (phone or laptop)");
     }
-    println!("Press Ctrl+C to stop.");
+    println!("Renders are saved in {renders_text}");
+    println!("To stop it, close this window or press Ctrl+C.");
+    if open {
+        open_browser(&url);
+    }
 
     // Stop on Ctrl+C, and when the launcher or a logout ends the program.
     // Open pages never close their live connection, so this does not wait
     // for them: it stops the worker (which stops ffmpeg), removes the temp
     // files and exits.
     tokio::spawn(async move {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal");
-        let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).expect("signal");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
-            _ = hup.recv() => {}
-        }
+        stop_signal().await;
         println!("Stopping...");
         app.send(Cmd::Quit);
         let join = tokio::task::spawn_blocking(move || worker_done.join());
@@ -180,6 +241,32 @@ async fn serve(port: u16) {
         std::process::exit(0);
     });
     let _ = axum::serve(listener, router).await;
+}
+
+/// Waits for Ctrl+C, or for the system to end the program (logout, the
+/// launcher stopping, or the console window closing on Windows).
+#[cfg(unix)]
+async fn stop_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).expect("signal");
+    let mut hup = signal(SignalKind::hangup()).expect("signal");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+        _ = hup.recv() => {}
+    }
+}
+
+#[cfg(windows)]
+async fn stop_signal() {
+    use tokio::signal::windows::{ctrl_close, ctrl_shutdown};
+    let mut close = ctrl_close().expect("signal");
+    let mut shutdown = ctrl_shutdown().expect("signal");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = close.recv() => {}
+        _ = shutdown.recv() => {}
+    }
 }
 
 #[derive(Deserialize)]
