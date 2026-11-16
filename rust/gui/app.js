@@ -116,6 +116,7 @@ function readSettings() {
   s.target_score = Number.isFinite(ts) && ts > 0 ? ts : 0;
   s.build_on = document.querySelector('input[name=frames][value=build]').checked;
   s.realtime = $("realtime").checked;
+  s.loop_video = $("loop_video").checked;
   // Unticked "Manual seed" sends an empty seed: a new random one each Restart.
   s.seed = $("seed_lock").checked ? $("seed").value.trim() : "";
   return s;
@@ -144,6 +145,7 @@ function fillSettings(s) {
     $("work-range").value = s.work_size;
     document.querySelector(`input[name=frames][value=${s.build_on ? "build" : "fresh"}]`).checked = true;
     $("realtime").checked = !!s.realtime;
+    $("loop_video").checked = !!s.loop_video;
     if (/^#?[0-9a-fA-F]{6}$/.test(s.background)) $("background-pick").value = "#" + s.background.replace("#", "");
   }
   fillSeed(s, typing);
@@ -205,6 +207,7 @@ $("settings-file").addEventListener("change", async () => {
 });
 $("target_score").addEventListener("change", sendSettings);
 $("realtime").addEventListener("change", sendSettings);
+$("loop_video").addEventListener("change", sendSettings);
 $("seed").addEventListener("change", sendSettings);
 $("seed_lock").addEventListener("change", () => { $("seed").disabled = !$("seed_lock").checked; sendSettings(); });
 // Typing a name pattern updates the example name shortly after.
@@ -524,6 +527,8 @@ function render() {
     if (st.score != null) parts.push(`score ${st.score.toFixed(4)}` + (s.target_score > 0 ? ` (stop at ${s.target_score})` : ""));
     if (isVideo) parts.push(`frame ${st.video.view + 1}/${st.video.frames}`);
     if (isVideo && s.build_on && st.video.frontier < st.video.frames) parts.push(st.build_paused ? `paused at frame ${st.video.frontier + 1}` : `building frame ${st.video.frontier + 1}`);
+    if (isVideo && st.video.loop_prep) parts.push(st.video.pass2_next < st.video.frames
+      ? `building the loop: frame ${st.video.pass2_next + 1}/${st.video.frames}` : "preparing the loop");
     info = parts.join("  ·  ");
   }
   $("info").textContent = info;
@@ -537,7 +542,9 @@ function render() {
   $("render-row").hidden = !rendering;
   if (rendering) {
     const r = st.render;
-    $("render-row").textContent = (st.build_paused ? "Paused. " : "") + `Rendering frame ${Math.min(r.frame + 1, r.frames)} of ${r.frames} — time left: ${duration(r.eta)}`;
+    const frameOf = `frame ${Math.min(r.frame + 1, r.frames)} of ${r.frames}`;
+    $("render-row").textContent = (st.build_paused ? "Paused. " : "") +
+      (r.prep ? `Preparing the loop: ${frameOf}` : `Rendering ${frameOf} — time left: ${duration(r.eta)}`);
   }
 
   // Settings are locked during a render.
@@ -546,6 +553,7 @@ function render() {
   }
   $("video-mode").hidden = !isVideo;
   $("realtime-row").hidden = !(isVideo && s.build_on);
+  $("loop-row").hidden = !(isVideo && s.build_on);
   $("fps-row").hidden = !(isVideo && st.video.sequence);
   $("custom-size").hidden = $("out_preset").value !== "custom";
   $("frame-opts").hidden = !$("export_fmt").value.endsWith("-seq");
@@ -653,6 +661,10 @@ const TIPS = {
     "Each frame gets shapes for exactly as long as it lasts in the video, then the next frame starts. The build runs at playback speed, so a scene change wipes in while you watch and motion leaves trails. The render saves the same shapes you saw.",
     "Shapes is then the most shapes a frame may get; set it high so the clock decides. The other search settings choose the look: fast settings give many rough shapes per frame, slow settings give few careful ones. The result depends on how fast the computer is at that moment. Frames that are not built yet when you press Render are built at the same speed.",
     "Press Play, watch the build, then Render when the last frame is done."],
+  loop_video: ["Loop video",
+    "Makes a video that joins up when it plays in a loop. The first frame is drawn on top of the last frame's picture instead of a plain color, so the end turns into the start like any other two frames.",
+    "When the last frame is built, every frame is built a second time. The second build starts on the last frame's picture, so the search picks shapes that suit it. This takes as long as the first build. Then the preview is drawn again and the render saves the looping version.",
+    "Build a short clip in real time, tick this, and watch the jump from the end to the start."],
   seq_fps: ["Frame rate",
     "How many pictures of the image sequence are shown each second.",
     "Pictures have no frame rate of their own, so you choose it here. It changes playback and the exported video length.",

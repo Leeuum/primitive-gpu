@@ -73,6 +73,9 @@ pub struct Settings {
     /// "Build on" mode: each frame is built for exactly its own length of
     /// time (1 / frame rate), so the build runs at playback speed.
     pub realtime: bool,
+    /// "Build on" mode: the first frame is drawn on top of the last
+    /// frame's picture, so the video joins up when it plays in a loop.
+    pub loop_video: bool,
     /// How the gap to the original is counted: "squared" or "plain".
     pub metric: String,
 }
@@ -104,6 +107,7 @@ impl Default for Settings {
             seed: String::new(),
             build_on: false,
             realtime: false,
+            loop_video: false,
             metric: "squared".into(),
         }
     }
@@ -275,6 +279,15 @@ struct VideoSrc {
     clock: Option<(Instant, usize)>,
     /// Background of frame 0, used by "build on" mode.
     bg0: [u8; 4],
+    /// "Loop video": the second build of every frame. It starts on the
+    /// last frame's picture of the first build, so the search picks shapes
+    /// for that picture instead of a plain color. Empty until it starts.
+    pass2: Vec<FrameData>,
+    /// First frame of the second build that is not finished.
+    pass2_next: usize,
+    /// The last frame's picture of the first build, where the second build
+    /// starts.
+    end1: Option<(Vec<u8>, Pixmap)>,
 }
 
 /// What turns the source into raw frames: ffmpeg for a video, a thread
@@ -342,8 +355,37 @@ enum Sink {
     Files { dir: PathBuf, fmt: &'static str, writer: FileWriter, naming: Naming },
 }
 
+/// Most laps "Loop video" draws before it takes the picture as settled.
+const MAX_LOOP_LAPS: u32 = 5;
+/// Two pictures are the same for "Loop video" when no color value differs
+/// by more than this.
+const LOOP_SAME: u8 = 2;
+
+/// "Loop video": the preview frames drawn again on top of the last
+/// frame's picture. One lap draws the shapes of every frame in order.
+enum LoopState {
+    /// Not made yet.
+    Idle,
+    Running(LoopPass),
+    /// The loop frames are in the cache. `laps` is how many laps from the
+    /// plain background the picture needs before it stops changing.
+    Ready { laps: u32 },
+}
+
+struct LoopPass {
+    canvas: Pixmap,
+    /// The picture at the start of this lap.
+    start: Pixmap,
+    next: usize,
+    laps: u32,
+    /// This lap saves its frames to the cache.
+    writing: bool,
+}
+
 struct RenderJob {
     next: usize,
+    /// "Loop video": laps drawn so far without saving frames.
+    lap: u32,
     sink: Sink,
     /// "Build on" mode with SVG files: every shape so far.
     acc: Option<(Vec<Shape>, Vec<[u8; 4]>)>,
@@ -400,6 +442,7 @@ pub struct Worker {
     dirty_status: bool,
     /// Last shown "build on" frame from the cache, so it is not sent twice.
     shown_cached: Option<usize>,
+    loop_pass: LoopState,
 }
 
 fn bg_from(background: &str, target: &[u8]) -> [u8; 4] {
@@ -488,6 +531,7 @@ impl Worker {
             dirty_pic: false,
             dirty_status: true,
             shown_cached: None,
+            loop_pass: LoopState::Idle,
         }
     }
 
@@ -570,6 +614,82 @@ impl Worker {
         self.settings.realtime && self.settings.build_on && self.video().is_some()
     }
 
+    /// "Loop video" is on for this source.
+    fn looping(&self) -> bool {
+        self.settings.loop_video && self.settings.build_on && self.video().is_some_and(|v| !v.frames.is_empty())
+    }
+
+    /// "Loop video": every frame of the first build is done and the second
+    /// build is not finished.
+    fn pass2_building(&self) -> bool {
+        self.looping() && self.video().is_some_and(|v| v.frontier >= v.frames.len() && v.pass2_next < v.frames.len())
+    }
+
+    /// "Loop video": how many laps a render draws without saving before the
+    /// lap it saves. The first is the first build, the rest are the second
+    /// build drawn again. None = the loop frames are not made yet.
+    fn render_laps(&self) -> Option<u32> {
+        match self.loop_pass {
+            LoopState::Ready { laps } => Some(laps + 1),
+            _ => None,
+        }
+    }
+
+    /// "Loop video": every frame is built and the loop frames are not
+    /// made yet.
+    fn loop_pending(&self) -> bool {
+        self.looping()
+            && self.video().is_some_and(|v| v.frontier >= v.frames.len())
+            && !matches!(self.loop_pass, LoopState::Ready { .. })
+    }
+
+    /// "Loop video": a short piece of the redraw of the second build. It
+    /// starts on the second build's last picture. Laps without saving run
+    /// until a lap ends on the picture it started from. Then one more lap
+    /// saves every frame to the cache.
+    fn loop_step(&mut self) {
+        let (Some(m), Source::Video(v)) = (&self.model, &self.source) else { return };
+        let n = v.frames.len();
+        if !matches!(self.loop_pass, LoopState::Running(_)) {
+            let pass = LoopPass { canvas: m.canvas.clone(), start: m.canvas.clone(), next: 0, laps: 1, writing: false };
+            self.loop_pass = LoopState::Running(pass);
+            self.dirty_status = true;
+        }
+        let LoopState::Running(p) = &mut self.loop_pass else { return };
+        let dir = self.tmp.join("built");
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_millis(30) {
+            if p.next < n {
+                let fd = &v.pass2[p.next];
+                model::draw_shapes(&mut p.canvas, &fd.shapes, &fd.colors, m.scale);
+                if p.writing {
+                    let bytes = jpeg(&load::pixmap_to_rgba(&p.canvas), 85);
+                    if let Err(e) = std::fs::write(dir.join(format!("loop-{}.jpg", p.next)), bytes) {
+                        self.loop_pass = LoopState::Idle;
+                        self.settings.loop_video = false;
+                        return self.fail(format!("writing the frame cache: {e}"));
+                    }
+                }
+                p.next += 1;
+            } else if p.writing {
+                self.loop_pass = LoopState::Ready { laps: p.laps };
+                self.shown_cached = None;
+                self.dirty_pic = true;
+                self.dirty_status = true;
+                return;
+            } else {
+                let same = p.canvas.data().iter().zip(p.start.data()).all(|(a, b)| a.abs_diff(*b) <= LOOP_SAME);
+                if same || p.laps >= MAX_LOOP_LAPS {
+                    p.writing = true;
+                } else {
+                    p.laps += 1;
+                    p.start = p.canvas.clone();
+                }
+                p.next = 0;
+            }
+        }
+    }
+
     /// "Real time" building: the frame has all its shapes before its time
     /// is up. How long the loop must wait until the frame's time is up.
     fn rt_wait(&self) -> Option<Duration> {
@@ -577,7 +697,9 @@ impl Worker {
             return None;
         }
         let v = self.video()?;
-        let building = v.frontier < v.frames.len() && self.render.as_ref().is_none_or(|r| r.next >= v.frontier);
+        let n = v.frames.len();
+        let building = (v.frontier < n && self.render.as_ref().is_none_or(|r| r.next >= v.frontier))
+            || (self.pass2_building() && self.render.as_ref().is_none_or(|r| r.next >= n));
         if !building {
             return None;
         }
@@ -589,6 +711,9 @@ impl Worker {
     /// clock decides: the frame gets shapes until its time is up, and a
     /// frame that is full early waits for the clock.
     fn build_frontier(&mut self) {
+        if self.pass2_building() && self.video().is_some_and(|v| v.pass2.is_empty()) {
+            self.start_pass2();
+        }
         if self.realtime() {
             let fps = self.video().map_or(24.0, |v| v.info.fps).max(0.1);
             let frame = Duration::from_secs_f64(1.0 / fps);
@@ -642,6 +767,13 @@ impl Worker {
         match &self.source {
             Source::Image(_) => (self.playing && !full).then_some(()).map_or(Some(Duration::from_secs(1)), |_| None),
             Source::Video(v) => {
+                if self.pass2_building() {
+                    if !self.building_paused() {
+                        return self.rt_wait();
+                    }
+                } else if self.loop_pending() {
+                    return None;
+                }
                 if self.settings.build_on && v.frontier < v.frames.len() && !self.building_paused() {
                     return self.rt_wait();
                 }
@@ -768,6 +900,10 @@ impl Worker {
         }
         if old.realtime != new.realtime {
             self.rt_due = None;
+        }
+        if old.loop_video != new.loop_video {
+            self.shown_cached = None;
+            self.dirty_pic = true;
         }
         // A flip of "fresh / build on" clears every frame.
         if old.build_on != new.build_on && self.video().is_some() {
@@ -900,6 +1036,7 @@ impl Worker {
         self.build_paused = None;
         self.rt_due = None;
         self.shown_cached = None;
+        self.loop_pass = LoopState::Idle;
     }
 
     fn load(&mut self, path: PathBuf, name: String) {
@@ -988,6 +1125,9 @@ impl Worker {
             Ok(m) => {
                 self.used_seed = seed;
                 self.model = Some(m);
+                // A new build starts its own "real time" clock. An old one
+                // would be in the past and leave the first frames empty.
+                self.rt_due = None;
                 self.applied = self.settings.restart_key();
                 self.dirty_pic = true;
                 self.publish_original();
@@ -1096,6 +1236,9 @@ impl Worker {
                     frontier: 0,
                     clock: None,
                     bg0: [0; 4],
+                    pass2: Vec::new(),
+                    pass2_next: 0,
+                    end1: None,
                 };
                 let (w, h) = (v.w as i32, v.h as i32);
                 self.source = Source::Video(v);
@@ -1155,10 +1298,14 @@ impl Worker {
         let _ = std::fs::remove_dir_all(self.tmp.join("built"));
         self.shown_cached = None;
         self.rt_due = None;
+        self.loop_pass = LoopState::Idle;
         let Source::Video(v) = &mut self.source else { return };
         for f in &mut v.frames {
             *f = FrameData::default();
         }
+        v.pass2.clear();
+        v.pass2_next = 0;
+        v.end1 = None;
         v.cur = 0;
         v.view = 0;
         v.frontier = 0;
@@ -1225,6 +1372,9 @@ impl Worker {
     /// "Build on" mode: the frontier frame is full. Keep it and start the
     /// next frame from its picture.
     fn finish_frontier(&mut self) {
+        if self.pass2_building() {
+            return self.finish_pass2();
+        }
         let Some(m) = &mut self.model else { return };
         let Source::Video(v) = &mut self.source else { return };
         let i = v.frontier;
@@ -1236,6 +1386,14 @@ impl Worker {
             return self.fail(format!("writing the frame cache: {e}"));
         }
         v.frontier += 1;
+        // A new frame makes the loop frames out of date.
+        self.loop_pass = LoopState::Idle;
+        v.pass2.clear();
+        v.pass2_next = 0;
+        v.end1 = None;
+        if v.frontier >= v.frames.len() {
+            v.end1 = Some((m.current().to_vec(), m.canvas.clone()));
+        }
         let (next, bg0) = (v.frontier, v.bg0);
         if next < v.frames.len() {
             let target = match self.read_frame(next) {
@@ -1250,6 +1408,45 @@ impl Worker {
         }
         self.dirty_status = true;
         self.dirty_pic = true;
+    }
+
+    /// "Loop video": start the second build at frame 0, on top of the
+    /// last frame's picture of the first build.
+    fn start_pass2(&mut self) {
+        let target = match self.read_frame(0) {
+            Ok(t) => t,
+            Err(e) => return self.fail(e),
+        };
+        let (Some(m), Source::Video(v)) = (&mut self.model, &mut self.source) else { return };
+        let start = v.end1.clone().unwrap_or_else(|| (m.current().to_vec(), m.canvas.clone()));
+        v.pass2 = vec![FrameData::default(); v.frames.len()];
+        v.pass2_next = 0;
+        m.set_target(target, v.bg0, Some(start));
+        v.cur = 0;
+        self.publish_original();
+        self.dirty_status = true;
+    }
+
+    /// "Loop video": a frame of the second build is done. Keep it and start
+    /// the next frame from its picture.
+    fn finish_pass2(&mut self) {
+        let (Some(m), Source::Video(v)) = (&mut self.model, &mut self.source) else { return };
+        let i = v.pass2_next;
+        v.pass2[i] = FrameData { shapes: m.shapes.clone(), colors: m.colors.clone(), scores: m.scores.clone() };
+        v.pass2_next += 1;
+        let next = v.pass2_next;
+        if next < v.frames.len() {
+            let target = match self.read_frame(next) {
+                Ok(t) => t,
+                Err(e) => return self.fail(e),
+            };
+            let (Some(m), Source::Video(v)) = (&mut self.model, &mut self.source) else { return };
+            let start = (m.current().to_vec(), m.canvas.clone());
+            m.set_target(target, v.bg0, Some(start));
+            v.cur = next;
+            self.publish_original();
+        }
+        self.dirty_status = true;
     }
 
     /// Moves the playhead by the playback clock. Loops at the end. In
@@ -1309,8 +1506,16 @@ impl Worker {
                     self.advance_clock();
                 }
                 let Source::Video(v) = &self.source else { return };
-                if v.frontier < v.frames.len() && !self.building_paused() {
-                    self.build_frontier();
+                if v.frontier < v.frames.len() {
+                    if !self.building_paused() {
+                        self.build_frontier();
+                    }
+                } else if self.pass2_building() {
+                    if !self.building_paused() {
+                        self.build_frontier();
+                    }
+                } else if self.loop_pending() {
+                    self.loop_step();
                 }
             }
             Source::Video(_) => {
@@ -1378,7 +1583,7 @@ impl Worker {
         }
         self.render_file = None;
         self.rt_due = None;
-        self.render = Some(RenderJob { next: 0, sink, acc, out, ow, oh, scale, started: Instant::now(), first: 0 });
+        self.render = Some(RenderJob { next: 0, lap: 0, sink, acc, out, ow, oh, scale, started: Instant::now(), first: 0 });
     }
 
     fn cancel_render(&mut self) {
@@ -1425,26 +1630,59 @@ impl Worker {
         let Source::Video(v) = &self.source else { return self.cancel_render() };
         let n = v.frames.len();
         let i = self.render.as_ref().unwrap().next;
+        // "Loop video": the render first draws laps without saving, so the
+        // saved lap starts on the last frame's picture.
+        let looping = self.looping();
+        let need = self.render_laps().unwrap_or(u32::MAX);
         if i >= n {
+            if looping {
+                if need == u32::MAX {
+                    if self.pass2_building() {
+                        return self.build_frontier();
+                    }
+                    return self.loop_step();
+                }
+                let r = self.render.as_mut().unwrap();
+                if r.lap < need {
+                    r.lap += 1;
+                    r.next = 0;
+                    if r.lap == need {
+                        r.started = Instant::now();
+                    }
+                    self.dirty_status = true;
+                    return;
+                }
+            }
             return self.finish_render();
         }
+        let lap = self.render.as_ref().unwrap().lap;
+        let silent = looping && lap < need;
         let pixels = self.render_wants_pixels();
         let result = if build_on {
             if i < v.frontier {
-                let fd = v.frames[i].clone();
+                // "Loop video": the first lap is the first build, the
+                // rest are the second build.
+                let fd = if looping && lap > 0 { v.pass2[i].clone() } else { v.frames[i].clone() };
                 let r = self.render.as_mut().unwrap();
                 let frame = if pixels {
                     let out = r.out.as_mut().unwrap();
                     model::draw_shapes(out, &fd.shapes, &fd.colors, r.scale);
-                    Payload::Pixels(out.clone())
+                    (!silent).then(|| Payload::Pixels(out.clone()))
                 } else {
                     let (shapes, colors) = r.acc.as_mut().unwrap();
                     shapes.extend_from_slice(&fd.shapes);
                     colors.extend_from_slice(&fd.colors);
                     let bg0 = if let Source::Video(v) = &self.source { v.bg0 } else { [0; 4] };
-                    Payload::Svg(model::svg_of(r.ow, r.oh, r.scale, bg0, shapes, colors))
+                    (!silent).then(|| Payload::Svg(model::svg_of(r.ow, r.oh, r.scale, bg0, shapes, colors)))
                 };
-                let res = self.write_frame(frame);
+                let res = match frame {
+                    Some(frame) => self.write_frame(frame),
+                    None => {
+                        r.next += 1;
+                        self.dirty_status = true;
+                        Ok(())
+                    }
+                };
                 if let Source::Video(v) = &mut self.source {
                     v.view = i;
                 }
@@ -1626,7 +1864,9 @@ impl Worker {
             let now = self.build_paused.filter(|_| self.building_paused()).unwrap_or_else(Instant::now);
             let el = now.saturating_duration_since(r.started).as_secs_f64();
             let eta = if done > 0 { Some(el / done as f64 * (n - r.next) as f64) } else { None };
-            json!({ "frame": r.next, "frames": n, "eta": eta })
+            // "Loop video": the laps before the saved one.
+            let prep = self.looping() && self.render_laps().is_none_or(|laps| r.lap < laps);
+            json!({ "frame": r.next, "frames": n, "eta": if prep { None } else { eta }, "prep": prep })
         });
         let video = self.video().map(|v| {
             json!({
@@ -1636,6 +1876,8 @@ impl Worker {
                 "frontier": v.frontier,
                 "timeline": self.timeline(),
                 "sequence": v.files.is_some(),
+                "loop_prep": self.loop_pending(),
+                "pass2_next": v.pass2_next,
             })
         });
         let (ow, oh) = m.map_or((0, 0), |m| {
@@ -1700,7 +1942,9 @@ impl Worker {
                 if self.shown_cached == Some(v.view) {
                     return;
                 }
-                let path = self.tmp.join("built").join(format!("{}.jpg", v.view));
+                let looped = self.settings.loop_video && matches!(self.loop_pass, LoopState::Ready { .. });
+                let file = if looped { format!("loop-{}.jpg", v.view) } else { format!("{}.jpg", v.view) };
+                let path = self.tmp.join("built").join(file);
                 if let Ok(b) = std::fs::read(path) {
                     self.shown_cached = Some(v.view);
                     self.pics.put(Pic::Jpeg(b));

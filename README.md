@@ -102,6 +102,7 @@ The page works from any device on the same network.
 - **Stopping:** "Shapes" sets the most shapes per picture, "Stop at score" stops once it is close enough, and "Fewest shapes" keeps dark frames from stopping too soon.
 - **Export:** PNG, JPG, SVG or a timelapse, at any size up to 4K without a new search.
 - **Videos:** every loop adds more shapes to each frame. Each frame can start fresh or build on the one before.
+- **Loop video:** in "build on" mode, makes a video that joins up when it plays in a loop. Every frame is built a second time, starting on the last frame's picture, so the end turns into the start like any other two frames.
 - **Render:** saves an MP4 or WebM (with the original sound), a GIF, or an image sequence to `primitive` in your Videos folder (Movies on a Mac). Existing files are never overwritten.
 
 **Security:** the GUI has no password and listens on all network interfaces. Never expose its port to the internet. To report a security problem, see [SECURITY.md](SECURITY.md).
