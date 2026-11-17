@@ -12,11 +12,11 @@ name = "primitive-gpu"
 path = "src/main.rs"
 
 [dependencies]
-wgpu = "29"
-pollster = "0.4"
+wgpu = "30"
+pollster = "1.0"
 bytemuck = { version = "1", features = ["derive"] }
 image = "0.25"
-tiny-skia = "0.11"
+tiny-skia = "0.12"
 rayon = "1"
 axum = { version = "0.8.9", features = ["ws"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "sync", "fs", "time", "signal", "io-util"] }
