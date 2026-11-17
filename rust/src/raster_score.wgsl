@@ -4,9 +4,16 @@
 // The color and blend math is in common.wgsl, which gpu.rs puts in front of
 // this file. This file only decides which pixels each thread visits.
 //
-// Work split: the 64 threads form 4 row groups of 16 lanes. Row group g
-// takes rows y0+g, y0+g+4, ...; within a row, lane l takes columns
-// c0+l, c0+l+16, ...
+// Work split: the 64 threads form 16 row groups of 4 lanes. Row group g
+// takes rows y0+g, y0+g+16, ...; within a row, lane l takes columns
+// c0+l, c0+l+4, ... Measured faster than 4 x 16: fewer idle threads on narrow
+// rows and less repeated per-row setup (2 x 32, 8 x 8, 32 x 2 and 64 x 1 were
+// slower).
+//
+// gpu.rs turns off wgpu's loop guard for this file, so every loop here and in
+// common.wgsl must end for any contents of a Cand. main() clamps the rows to
+// the image, the column loops work in image columns (0 .. width-1), and the
+// curve clamps its piece count. Keep it that way when adding a loop.
 
 // One candidate. Kinds use the shape mode numbers (circles use 3).
 //   1-5 hard-edged shapes: see walk_triangle, walk_rectangle, walk_ellipse,
@@ -35,8 +42,8 @@ struct Cand {
 @group(0) @binding(4) var<storage, read_write> results: array<Result>;
 @group(0) @binding(5) var<storage, read> prefix: array<i32>;
 
-const LANES: i32 = 16;
-const ROWS: i32 = 4;
+const LANES: i32 = 4;
+const ROWS: i32 = 16;
 
 // ---- polygon ----
 // The CPU (raster.rs fill_polygon) adds each edge's signed area into cells
@@ -144,13 +151,14 @@ fn walk_polygon(cd: Cand, phase: u32, lid: u32) {
     let lane = i32(lid) % LANES;
     for (var y = cd.y0 + i32(lid) / LANES; y <= cd.y1; y += ROWS) {
         let pr = poly_row(cd, f32(y - cd.y0));
-        let c0 = max(pr.c0, -ox);
-        let c1 = min(pr.c1, w - 1 - ox);
-        for (var c = c0 + lane; c <= c1; c += LANES) {
-            let s = poly_cov(pr, f32(c));
+        // Image columns, so the loop stays inside 0 .. w-1.
+        let x0 = max(ox + pr.c0, 0);
+        let x1 = min(ox + pr.c1, w - 1);
+        for (var x = x0 + lane; x <= x1; x += LANES) {
+            let s = poly_cov(pr, f32(x - ox));
             let ma = u32(min(abs(s), 1.0) * 65535.0);
             if (ma > 0u) {
-                visit(phase, u32(y * w + ox + c), ma);
+                visit(phase, u32(y * w + x), ma);
             }
         }
     }
@@ -249,13 +257,14 @@ fn walk_rotated_ellipse(cd: Cand, phase: u32, lid: u32) {
     let lane = i32(lid) % LANES;
     for (var y = cd.y0 + i32(lid) / LANES; y <= cd.y1; y += ROWS) {
         let er = ell_row(cd, f32(y - cd.y0));
-        let c0 = max(er.c0, -ox);
-        let c1 = min(er.c1, w - 1 - ox);
-        for (var c = c0 + lane; c <= c1; c += LANES) {
-            let s = ell_cov(er, f32(c));
+        // Image columns, so the loop stays inside 0 .. w-1.
+        let x0 = max(ox + er.c0, 0);
+        let x1 = min(ox + er.c1, w - 1);
+        for (var x = x0 + lane; x <= x1; x += LANES) {
+            let s = ell_cov(er, f32(x - ox));
             let ma = u32(clamp(s, 0.0, 1.0) * 65535.0);
             if (ma > 0u) {
-                visit(phase, u32(y * w + ox + c), ma);
+                visit(phase, u32(y * w + x), ma);
             }
         }
     }
@@ -272,7 +281,7 @@ fn walk_rotated_ellipse(cd: Cand, phase: u32, lid: u32) {
 var<workgroup> cv_pts: array<vec2<f32>, 129>;
 
 fn curve_setup(cd: Cand, lid: u32) {
-    let n = u32(cd.p1.z);
+    let n = min(u32(cd.p1.z), 128u); // cv_pts holds 129 points
     for (var i = lid; i <= n; i += WG) {
         let t = f32(i) / f32(n);
         let u = 1.0 - t;
@@ -328,8 +337,9 @@ fn curve_row(cd: Cand, r: i32) -> CurveRow {
     cr.b = cr.a;
     cr.sa = vec2<i32>(1, 0);
     cr.sb = cr.sa;
-    let n = i32(cd.p1.z);
-    let j = i32(cd.p1.w);
+    // Clamped as in curve_setup; 0 <= j <= n keeps the halving searches finite.
+    let n = clamp(i32(cd.p1.z), 0, 128);
+    let j = clamp(i32(cd.p1.w), 0, n);
     let reach = cd.p2.z;
     let cy = f32(r) + 0.5;
     var sa0 = n;
@@ -419,17 +429,18 @@ fn walk_curve(cd: Cand, phase: u32, lid: u32) {
     for (var y = cd.y0 + i32(lid) / LANES; y <= cd.y1; y += ROWS) {
         let r = y - cd.y0;
         let cr = curve_row(cd, r);
-        let a0 = max(cr.a.x, -ox);
-        let a1 = min(cr.a.y, w - 1 - ox);
-        let b0 = max(cr.b.x, -ox);
-        let b1 = min(cr.b.y, w - 1 - ox);
-        let na = max(a1 - a0 + 1, 0);
-        let nb = max(b1 - b0 + 1, 0);
+        // Image columns, so na and nb are at most w.
+        let a0 = max(ox + cr.a.x, 0);
+        let a1 = min(ox + cr.a.y, w - 1);
+        let b0 = max(ox + cr.b.x, 0);
+        let b1 = min(ox + cr.b.y, w - 1);
+        let na = select(0, a1 - a0 + 1, a1 >= a0);
+        let nb = select(0, b1 - b0 + 1, b1 >= b0);
         let cy = f32(r) + 0.5;
         for (var k = lane; k < na + nb; k += LANES) {
-            var c = a0 + k;
+            var c = a0 + k - ox;
             if (k >= na) {
-                c = b0 + k - na;
+                c = b0 + k - na - ox;
             }
             let p = vec2<f32>(f32(c) + 0.5, cy);
             var d2 = seg_d2(cr.sa.x, cr.sa.y, p, 3.0e38);
@@ -682,7 +693,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     if (ci >= params.count) {
         return;
     }
-    let cd = cands[ci];
+    var cd = cands[ci];
+    // Rows outside the image are never drawn (gpu_record clamps them too);
+    // this keeps every row loop finite whatever y0 and y1 hold.
+    cd.y0 = clamp(cd.y0, 0, i32(params.height));
+    cd.y1 = min(cd.y1, i32(params.height) - 1);
     if (cd.kind == 6u && cd.y1 >= cd.y0) {
         curve_setup(cd, lid);
     }

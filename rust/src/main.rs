@@ -6,6 +6,7 @@ use image::codecs::jpeg::JpegEncoder;
 use image::{Delay, Frame};
 use primitive_gpu::core::Metric;
 use primitive_gpu::load::{self, parse_hex, pixmap_to_rgba};
+use primitive_gpu::constraints::{AngleRule, Constraints, Detail, Mask};
 use primitive_gpu::model::{self, Model, SearchConfig};
 use primitive_gpu::shapes;
 use std::io::{Read, Write};
@@ -37,6 +38,11 @@ struct Args {
     log: u32,
     search: SearchConfig,
     seed: Option<u64>,
+    /// Creative rules for the shapes.
+    cons: Constraints,
+    shrink: bool,
+    mask: String,
+    detail: String,
 }
 
 fn usage() -> ! {
@@ -63,11 +69,30 @@ fn usage() -> ! {
                  -n is then the most shapes (default: off)
   -v, -vv        verbose / very verbose
 
+Creative rules for the shapes (all off by default):
+  -angle <deg>   every shape leans this way: 0 = flat, 90 = upright
+                 (angle rules work with modes 5, 6 and 7)
+  -angle-step <deg>  only angles this far apart, e.g. 45; counted from -angle
+  -toward <x,y>  shapes point at this spot; x,y in percent of the width
+                 and height, e.g. 50,30
+  -around <x,y>  shapes run in rings around this spot
+  -min-size <p>  smallest shape, in percent of the picture's long side
+  -max-size <p>  largest shape, in percent of the picture's long side
+  -shrink        the largest size falls from -max-size to -min-size
+                 during the run (big shapes first, details last)
+  -min-ratio <x> shapes are at least x times as long as wide (thin strokes)
+  -max-ratio <x> shapes are at most x times as long as wide (1 = square)
+                 (ratio rules work with modes 2, 3, 5 and 7)
+  -grid <n>      snap shapes to a grid of n cells along the long side
+  -mask <path>   picture of the area where shapes may be: white = allowed
+  -detail <path> picture of the detail area: white = small shapes (up to
+                 -min-size), black = big shapes (half of -max-size up to it)
+
 GPU search tuning:
   -chains <n>    hill-climb chains per shape (default 16)
   -random <n>    random tries that seed each chain (default 1000)
   -age <n>       tries without improvement before a chain stops (default 100)
-  -k <n>         mutations each chain tries per GPU round (default 32)
+  -k <n>         mutations each chain tries per GPU round (default 64)
   -seed <n>      random seed (default: from the clock)
   -raster <cpu|gpu>  who draws the candidate shapes (default gpu); cpu is
                  the older path, kept for comparison
@@ -93,8 +118,12 @@ fn parse_args() -> Args {
         repeat: 0,
         target_score: 0.0,
         log: 0,
-        search: SearchConfig { chains: 16, random: 1000, age: 100, k: 32, gpu_draw: true, check: false, metric: Metric::Squared },
+        search: SearchConfig { chains: 16, random: 1000, age: 100, k: 64, gpu_draw: true, check: false, metric: Metric::Squared },
         seed: None,
+        cons: Constraints::default(),
+        shrink: false,
+        mask: String::new(),
+        detail: String::new(),
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -114,6 +143,10 @@ fn parse_args() -> Args {
             "h" | "help" => usage(),
             "check" => {
                 a.search.check = inline.as_deref().is_none_or(|v| v == "true" || v == "1");
+                continue;
+            }
+            "shrink" => {
+                a.shrink = inline.as_deref().is_none_or(|v| v == "true" || v == "1");
                 continue;
             }
             "v" | "vv" => {
@@ -142,7 +175,44 @@ fn parse_args() -> Args {
                 usage()
             })
         };
+        let real = |v: &str| -> f64 {
+            v.parse().ok().filter(|x: &f64| x.is_finite()).unwrap_or_else(|| {
+                eprintln!("ERROR: invalid value \"{v}\" for -{name}");
+                usage()
+            })
+        };
+        let spot = |v: &str| -> (f64, f64) {
+            match v.split_once(',') {
+                Some((x, y)) => (real(x.trim()) / 100.0, real(y.trim()) / 100.0),
+                None => {
+                    eprintln!("ERROR: -{name} needs x,y in percent, e.g. 50,30");
+                    usage()
+                }
+            }
+        };
         match name.as_str() {
+            "angle" => {
+                a.cons.angle_deg = real(&value);
+                if a.cons.angle == AngleRule::Free {
+                    a.cons.angle = AngleRule::Fixed;
+                }
+            }
+            "angle-step" => a.cons.angle_step = real(&value).max(0.0),
+            "toward" => {
+                a.cons.point = spot(&value);
+                a.cons.angle = AngleRule::Toward;
+            }
+            "around" => {
+                a.cons.point = spot(&value);
+                a.cons.angle = AngleRule::Around;
+            }
+            "min-size" => a.cons.min_size = real(&value).max(0.0) / 100.0,
+            "max-size" => a.cons.max_size = real(&value).max(0.0) / 100.0,
+            "min-ratio" => a.cons.min_ratio = real(&value).max(0.0),
+            "max-ratio" => a.cons.max_ratio = real(&value).max(0.0),
+            "grid" => a.cons.grid_cells = num(&value).max(0) as u32,
+            "mask" => a.mask = value,
+            "detail" => a.detail = value,
             "i" => a.input = value,
             "o" => a.outputs.push(value),
             "n" => {
@@ -204,6 +274,13 @@ fn parse_args() -> Args {
     if a.configs.is_empty() {
         eprintln!("ERROR: number argument required");
         ok = false;
+    }
+    // Steps are counted from -angle, so the two together mean steps.
+    if a.cons.angle_step > 0.0 && a.cons.angle == AngleRule::Fixed {
+        a.cons.angle = AngleRule::Free;
+    }
+    if a.shrink {
+        a.cons.shrink_over = a.configs.iter().map(|c| c.count).sum();
     }
     if a.configs.len() == 1 {
         a.configs[0].mode = a.mode;
@@ -335,6 +412,30 @@ fn main() {
         eprintln!("ERROR: {e}");
         exit(1)
     });
+    let mut cons = args.cons.clone();
+    if !args.mask.is_empty() {
+        let m = load::open_image(&args.mask).unwrap_or_else(|e| {
+            eprintln!("ERROR: {e}");
+            exit(1)
+        });
+        let gray = image::imageops::resize(&m.to_luma8(), w as u32, h as u32, image::imageops::FilterType::Triangle);
+        cons.mask = Mask::new(w, h, gray.as_raw()).map(std::sync::Arc::new);
+        if cons.mask.is_none() {
+            eprintln!("WARNING: the mask is all black or all white, so it is not used");
+        }
+    }
+    if !args.detail.is_empty() {
+        let m = load::open_image(&args.detail).unwrap_or_else(|e| {
+            eprintln!("ERROR: {e}");
+            exit(1)
+        });
+        let gray = image::imageops::resize(&m.to_luma8(), w as u32, h as u32, image::imageops::FilterType::Triangle);
+        cons.detail = Detail::new(w, h, gray.as_raw()).map(std::sync::Arc::new);
+        if cons.detail.is_none() {
+            eprintln!("WARNING: the detail picture has no white part, so it is not used");
+        }
+    }
+    model.set_constraints(cons);
     v!("gpu: {}\n", model.gpu_name());
     v!("{}: t={:.3}, score={:.6}\n", 0, 0.0, model.score);
 

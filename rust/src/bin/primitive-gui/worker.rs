@@ -6,6 +6,7 @@ use crate::video::{self, VideoInfo};
 use image::codecs::jpeg::JpegEncoder;
 use primitive_gpu::core::Metric;
 use primitive_gpu::load;
+use primitive_gpu::constraints::{AngleRule, Constraints, Detail, Mask};
 use primitive_gpu::model::{self, Model, SearchConfig};
 use primitive_gpu::shapes::Shape;
 use serde::{Deserialize, Serialize};
@@ -34,9 +35,13 @@ const MAX_DECODE_BYTES: f64 = 4.0e9;
 #[serde(default)]
 pub struct Settings {
     pub count: usize,
-    /// Stop a picture early once its score is at or below this. 0 = off.
-    pub target_score: f64,
-    /// Fewest shapes before `target_score` may stop a picture.
+    /// Stop a picture early once this share of its contrast is matched,
+    /// in percent (see `Settings::done`). 0 = off.
+    pub stop_match: f64,
+    /// Lowest score that `stop_match` asks for, whatever the picture's
+    /// contrast. 0 = off.
+    pub stop_floor: f64,
+    /// Fewest shapes before `stop_match` may stop a picture.
     pub min_count: usize,
     pub mode: i32,
     pub alpha: i32,
@@ -78,13 +83,35 @@ pub struct Settings {
     pub loop_video: bool,
     /// How the gap to the original is counted: "squared" or "plain".
     pub metric: String,
+    /// Shape rules (creative constraints). Direction: "free", "fixed",
+    /// "steps", "toward" or "around".
+    pub c_angle: String,
+    pub c_angle_deg: f64,
+    pub c_angle_step: f64,
+    /// The spot for "toward" and "around", in percent of width and height.
+    pub c_x: f64,
+    pub c_y: f64,
+    /// Smallest and largest shape in percent of the long side. 0 = off.
+    pub c_min_size: f64,
+    pub c_max_size: f64,
+    /// The largest size falls to the smallest over `count` shapes.
+    pub c_shrink: bool,
+    /// Limits for long side / short side. 0 = off.
+    pub c_min_ratio: f64,
+    pub c_max_ratio: f64,
+    /// Grid cells along the long side. 0 = off.
+    pub c_grid: u32,
+    /// What the painted area means: "only" (shapes stay inside it) or
+    /// "detail" (small shapes inside it, big shapes in the rest).
+    pub c_area: String,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
         Settings {
             count: 250,
-            target_score: 0.0,
+            stop_match: 0.0,
+            stop_floor: 0.01,
             min_count: 0,
             mode: 1,
             alpha: 128,
@@ -103,22 +130,52 @@ impl Default for Settings {
             chains: 16,
             random: 1000,
             age: 100,
-            k: 32,
+            k: 64,
             seed: String::new(),
             build_on: false,
             realtime: false,
             loop_video: false,
             metric: "squared".into(),
+            c_angle: "free".into(),
+            c_angle_deg: 0.0,
+            c_angle_step: 45.0,
+            c_x: 50.0,
+            c_y: 50.0,
+            c_min_size: 0.0,
+            c_max_size: 0.0,
+            c_shrink: false,
+            c_min_ratio: 0.0,
+            c_max_ratio: 0.0,
+            c_grid: 0,
+            c_area: "only".into(),
         }
     }
 }
 
 impl Settings {
+    /// The score at which `stop_match` stops a picture of this contrast,
+    /// or None when it is off. The floor keeps a nearly flat picture from
+    /// taking shapes that only chase noise.
+    fn stop_score(&self, contrast: f64) -> Option<f64> {
+        (self.stop_match > 0.0).then(|| (contrast * (1.0 - self.stop_match / 100.0)).max(self.stop_floor))
+    }
+
+    /// True when a picture with `n` shapes, this score and this contrast
+    /// needs no more shapes: it has the shape limit, or it has the fewest
+    /// shapes and its score is at or below `stop_score`.
+    fn done(&self, n: usize, score: Option<f64>, contrast: f64) -> bool {
+        let reached = || matches!((score, self.stop_score(contrast)), (Some(sc), Some(t)) if sc <= t);
+        n >= self.count || (n >= self.min_count && reached())
+    }
+
     fn clamped(mut self) -> Settings {
         self.count = self.count.clamp(1, 100_000);
         self.min_count = self.min_count.min(100_000);
-        if !(self.target_score > 0.0 && self.target_score < 1.0) {
-            self.target_score = 0.0;
+        if !(self.stop_match > 0.0 && self.stop_match < 100.0) {
+            self.stop_match = 0.0;
+        }
+        if !(self.stop_floor >= 0.0 && self.stop_floor < 1.0) {
+            self.stop_floor = 0.0;
         }
         self.mode = self.mode.clamp(0, 8);
         self.alpha = self.alpha.clamp(0, 255);
@@ -141,7 +198,48 @@ impl Settings {
         self.background = self.background.trim().to_string();
         self.seed = self.seed.trim().to_string();
         self.metric = self.metric_kind().name().into();
+        if !["free", "fixed", "steps", "toward", "around"].contains(&self.c_angle.as_str()) {
+            self.c_angle = "free".into();
+        }
+        let fin = |v: f64, lo: f64, hi: f64, d: f64| if v.is_finite() { v.clamp(lo, hi) } else { d };
+        self.c_angle_deg = fin(self.c_angle_deg, -360.0, 360.0, 0.0);
+        self.c_angle_step = fin(self.c_angle_step, 1.0, 180.0, 45.0);
+        self.c_x = fin(self.c_x, -100.0, 200.0, 50.0);
+        self.c_y = fin(self.c_y, -100.0, 200.0, 50.0);
+        self.c_min_size = fin(self.c_min_size, 0.0, 100.0, 0.0);
+        self.c_max_size = fin(self.c_max_size, 0.0, 100.0, 0.0);
+        self.c_min_ratio = fin(self.c_min_ratio, 0.0, 100.0, 0.0);
+        self.c_max_ratio = fin(self.c_max_ratio, 0.0, 100.0, 0.0);
+        self.c_grid = self.c_grid.min(256);
+        if self.c_area != "detail" {
+            self.c_area = "only".into();
+        }
         self
+    }
+
+    /// The shape rules, without the painted area.
+    fn constraints(&self) -> Constraints {
+        let (angle, angle_step) = match self.c_angle.as_str() {
+            "fixed" => (AngleRule::Fixed, 0.0),
+            "steps" => (AngleRule::Free, self.c_angle_step),
+            "toward" => (AngleRule::Toward, 0.0),
+            "around" => (AngleRule::Around, 0.0),
+            _ => (AngleRule::Free, 0.0),
+        };
+        Constraints {
+            angle,
+            angle_deg: self.c_angle_deg,
+            angle_step,
+            point: (self.c_x / 100.0, self.c_y / 100.0),
+            min_size: self.c_min_size / 100.0,
+            max_size: self.c_max_size / 100.0,
+            shrink_over: if self.c_shrink { self.count } else { 0 },
+            min_ratio: self.c_min_ratio,
+            max_ratio: self.c_max_ratio,
+            grid_cells: self.c_grid,
+            mask: None,
+            detail: None,
+        }
     }
 
     fn metric_kind(&self) -> Metric {
@@ -174,6 +272,9 @@ pub enum Cmd {
     /// "Build on" mode: stop (true) or go on with (false) building frames.
     PauseBuild(bool),
     Restart,
+    /// The painted area where shapes may be: `w` x `h` gray values, or
+    /// empty for no limit.
+    Mask { w: usize, h: usize, gray: Vec<u8> },
     Seek(usize),
     Render,
     Cancel,
@@ -249,6 +350,10 @@ struct FrameData {
     shapes: Vec<Shape>,
     colors: Vec<[u8; 4]>,
     scores: Vec<f64>,
+    /// `Model::contrast` of the frame's picture, for `Settings::done`.
+    contrast: f64,
+    /// Time spent adding the frame's shapes.
+    time: Duration,
 }
 
 struct ImageSrc {
@@ -412,6 +517,8 @@ pub struct Worker {
     settings: Settings,
     /// `restart_key` of the settings the current job was started with.
     applied: (u32, String, String, String),
+    /// The painted area where shapes may be: width, height, gray values.
+    mask: Option<(usize, usize, Vec<u8>)>,
     /// The seed the current search was started with (shown on the page).
     used_seed: u64,
     source: Source,
@@ -438,11 +545,17 @@ pub struct Worker {
     /// Set while the worker has work no page needs to watch (see `is_busy`).
     busy: Arc<AtomicBool>,
     last_publish: Instant,
+    /// Time spent adding the shapes of the picture in the model (shown on
+    /// the page next to the match).
+    build_time: Duration,
     dirty_pic: bool,
     dirty_status: bool,
     /// Last shown "build on" frame from the cache, so it is not sent twice.
     shown_cached: Option<usize>,
     loop_pass: LoopState,
+    /// Restart with a new working size: the frame the playhead was on, to
+    /// go back to when the video is decoded again.
+    restart_view: Option<usize>,
 }
 
 fn bg_from(background: &str, target: &[u8]) -> [u8; 4] {
@@ -509,6 +622,7 @@ impl Worker {
             tmp,
             renders,
             applied: settings.restart_key(),
+            mask: None,
             used_seed: 0,
             settings,
             source: Source::None,
@@ -528,10 +642,12 @@ impl Worker {
             pics,
             busy,
             last_publish: Instant::now(),
+            build_time: Duration::ZERO,
             dirty_pic: false,
             dirty_status: true,
             shown_cached: None,
             loop_pass: LoopState::Idle,
+            restart_view: None,
         }
     }
 
@@ -593,15 +709,6 @@ impl Worker {
 
     fn shape_count(&self) -> usize {
         self.model.as_ref().map_or(0, |m| m.shapes.len())
-    }
-
-    /// True when a picture with `n` shapes and this score needs no more
-    /// shapes: it has the shape limit, or it has the fewest shapes and has
-    /// reached the target score.
-    fn is_full(&self, n: usize, score: Option<f64>) -> bool {
-        let s = &self.settings;
-        let t = s.target_score;
-        n >= s.count || (t > 0.0 && n >= s.min_count && score.is_some_and(|sc| sc <= t))
     }
 
     /// True when frame building is paused. Only "build on" mode can pause.
@@ -733,9 +840,9 @@ impl Worker {
         }
     }
 
-    /// `is_full` for the picture that is being worked on now.
+    /// `Settings::done` for the picture that is being worked on now.
     fn full(&self) -> bool {
-        self.model.as_ref().is_some_and(|m| self.is_full(m.shapes.len(), Some(m.score)))
+        self.model.as_ref().is_some_and(|m| self.settings.done(m.shapes.len(), Some(m.score), m.contrast))
     }
 
     /// True when there is search work that "Restart" or a mode flip would
@@ -844,6 +951,13 @@ impl Worker {
                     self.restart();
                 }
             }
+            Cmd::Mask { w, h, gray } => {
+                if self.render.is_some() {
+                    return;
+                }
+                self.mask = (w > 0 && h > 0 && gray.len() == w * h).then_some((w, h, gray));
+                self.push_constraints();
+            }
             Cmd::Seek(f) => {
                 if self.render.is_none() {
                     self.seek(f);
@@ -898,6 +1012,7 @@ impl Worker {
         if let Some(m) = &mut self.model {
             m.set_search(new.search());
         }
+        self.push_constraints();
         if old.realtime != new.realtime {
             self.rt_due = None;
         }
@@ -909,14 +1024,11 @@ impl Worker {
         if old.build_on != new.build_on && self.video().is_some() {
             self.reset_video_frames();
         }
-        // A higher shape count or a lower target score lets a finished
+        // A higher shape count or another stop setting lets a finished
         // image go on.
-        let loosened = new.count > old.count || new.target_score != old.target_score || new.min_count > old.min_count;
+        let loosened = new.count > old.count || new.stop_match != old.stop_match || new.stop_floor != old.stop_floor || new.min_count > old.min_count;
         if loosened && matches!(self.source, Source::Image(_)) && !self.full() {
-            let was_full = self.model.as_ref().is_some_and(|m| {
-                let n = m.shapes.len();
-                n >= old.count || (old.target_score > 0.0 && n >= old.min_count && m.score <= old.target_score)
-            });
+            let was_full = self.model.as_ref().is_some_and(|m| old.done(m.shapes.len(), Some(m.score), m.contrast));
             if was_full {
                 self.playing = true;
             }
@@ -1118,6 +1230,25 @@ impl Worker {
         bg_from(&self.settings.background, target)
     }
 
+    /// Give the model the shape rules from the settings and the painted
+    /// area (stretched to the working size).
+    fn push_constraints(&mut self) {
+        let Some(m) = &mut self.model else {
+            return;
+        };
+        let mut c = self.settings.constraints();
+        if let Some((sw, sh, src)) = &self.mask {
+            let (w, h) = (m.w as usize, m.h as usize);
+            let gray: Vec<u8> = (0..w * h).map(|i| src[(i / w * sh / h) * sw + (i % w) * sw / w]).collect();
+            if self.settings.c_area == "detail" {
+                c.detail = Detail::new(m.w, m.h, &gray).map(std::sync::Arc::new);
+            } else {
+                c.mask = Mask::new(m.w, m.h, &gray).map(std::sync::Arc::new);
+            }
+        }
+        m.set_constraints(c);
+    }
+
     fn new_model(&mut self, target: Vec<u8>, w: i32, h: i32) -> bool {
         let bg = self.bg_for(&target);
         let seed = self.seed();
@@ -1125,6 +1256,8 @@ impl Worker {
             Ok(m) => {
                 self.used_seed = seed;
                 self.model = Some(m);
+                self.build_time = Duration::ZERO;
+                self.push_constraints();
                 // A new build starts its own "real time" clock. An old one
                 // would be in the past and leave the first frames empty.
                 self.rt_due = None;
@@ -1175,6 +1308,7 @@ impl Worker {
     /// the picture list of an image sequence, None for a video.
     fn decode_video(&mut self, path: PathBuf, name: String, info: VideoInfo, files: Option<Vec<PathBuf>>) {
         self.resolve_out();
+        self.restart_view = None;
         let (w, h) = video::fit(info.width, info.height, self.settings.work_size);
         let expected = (info.duration * info.fps).max(1.0);
         let bytes = expected * (w * h * 4) as f64;
@@ -1214,6 +1348,7 @@ impl Worker {
             }
             Some(res) => {
                 let d = self.decode.take().unwrap();
+                let keep = self.restart_view.take().unwrap_or(0);
                 let frame_bytes = (d.w * d.h * 4) as u64;
                 let n = std::fs::metadata(&d.raw).map(|m| m.len()).unwrap_or(0) / frame_bytes;
                 if res.is_err() || n == 0 {
@@ -1222,6 +1357,7 @@ impl Worker {
                     self.fail(format!("Could not decode {}: {}", d.name, res.err().unwrap_or_default()));
                     return;
                 }
+                let keep = if self.settings.build_on { 0 } else { keep.min(n as usize - 1) };
                 let v = VideoSrc {
                     path: d.path,
                     files: d.files,
@@ -1231,8 +1367,8 @@ impl Worker {
                     w: d.w,
                     h: d.h,
                     frames: vec![FrameData::default(); n as usize],
-                    cur: 0,
-                    view: 0,
+                    cur: keep,
+                    view: keep,
                     frontier: 0,
                     clock: None,
                     bg0: [0; 4],
@@ -1240,18 +1376,8 @@ impl Worker {
                     pass2_next: 0,
                     end1: None,
                 };
-                let (w, h) = (v.w as i32, v.h as i32);
                 self.source = Source::Video(v);
-                match self.read_frame(0) {
-                    Ok(t) => {
-                        let bg = self.bg_for(&t);
-                        if let Source::Video(v) = &mut self.source {
-                            v.bg0 = bg;
-                        }
-                        self.new_model(t, w, h);
-                    }
-                    Err(e) => self.fail(e),
-                }
+                self.start_frames_at(keep);
                 self.fix_format();
                 self.dirty_status = true;
             }
@@ -1284,7 +1410,11 @@ impl Worker {
                     let _ = std::fs::remove_file(&v.raw);
                     self.model = None;
                     self.playing = false;
+                    let view = v.view;
                     self.decode_video(v.path, v.name, v.info, v.files);
+                    if self.decode.is_some() {
+                        self.restart_view = Some(view);
+                    }
                 } else {
                     self.reset_video_frames();
                 }
@@ -1293,8 +1423,11 @@ impl Worker {
         }
     }
 
-    /// Clears every frame's shapes and starts again at frame 0.
+    /// Clears every frame's shapes and starts again. "Fresh" mode stays on
+    /// the frame the playhead is on. "Build on" mode goes back to frame 0,
+    /// because every frame there needs the frames before it.
     fn reset_video_frames(&mut self) {
+        let build_on = self.settings.build_on;
         let _ = std::fs::remove_dir_all(self.tmp.join("built"));
         self.shown_cached = None;
         self.rt_due = None;
@@ -1306,23 +1439,38 @@ impl Worker {
         v.pass2.clear();
         v.pass2_next = 0;
         v.end1 = None;
-        v.cur = 0;
-        v.view = 0;
+        let keep = if build_on { 0 } else { v.view.min(v.frames.len().saturating_sub(1)) };
+        v.cur = keep;
+        v.view = keep;
         v.frontier = 0;
         if v.clock.is_some() {
-            v.clock = Some((Instant::now(), 0));
+            v.clock = Some((Instant::now(), keep));
         }
+        self.start_frames_at(keep);
+    }
+
+    /// Starts a new model on frame `keep`. The background of frame 0 is
+    /// kept for "build on" mode.
+    fn start_frames_at(&mut self, keep: usize) {
+        let Source::Video(v) = &self.source else { return };
         let (w, h) = (v.w as i32, v.h as i32);
-        match self.read_frame(0) {
-            Ok(t) => {
-                let bg = self.bg_for(&t);
-                if let Source::Video(v) = &mut self.source {
-                    v.bg0 = bg;
-                }
-                self.new_model(t, w, h);
-            }
-            Err(e) => self.fail(e),
+        let first = match self.read_frame(0) {
+            Ok(t) => t,
+            Err(e) => return self.fail(e),
+        };
+        let bg = self.bg_for(&first);
+        if let Source::Video(v) = &mut self.source {
+            v.bg0 = bg;
         }
+        let target = if keep == 0 {
+            first
+        } else {
+            match self.read_frame(keep) {
+                Ok(t) => t,
+                Err(e) => return self.fail(e),
+            }
+        };
+        self.new_model(target, w, h);
     }
 
     // ------------------------------------------------------------- video
@@ -1339,6 +1487,8 @@ impl Worker {
         fd.shapes = m.shapes.clone();
         fd.colors = m.colors.clone();
         fd.scores = m.scores.clone();
+        fd.contrast = m.contrast;
+        fd.time = self.build_time;
         let target = match self.read_frame(i) {
             Ok(t) => t,
             Err(e) => return self.fail(e),
@@ -1351,6 +1501,7 @@ impl Worker {
         fd.scores.truncate(count);
         m.set_target(target, bg, None);
         m.load_shapes(&fd.shapes, &fd.colors, &fd.scores);
+        self.build_time = fd.time;
         v.cur = i;
         self.dirty_pic = true;
         self.publish_original();
@@ -1360,7 +1511,9 @@ impl Worker {
         let s = &self.settings;
         let (mode, alpha, repeat, count) = (s.mode, s.alpha, s.repeat, s.count);
         if let Some(m) = &mut self.model {
+            let t0 = Instant::now();
             m.step(mode, alpha, repeat);
+            self.build_time += t0.elapsed();
             if m.shapes.len() > count {
                 m.truncate(count);
             }
@@ -1378,7 +1531,8 @@ impl Worker {
         let Some(m) = &mut self.model else { return };
         let Source::Video(v) = &mut self.source else { return };
         let i = v.frontier;
-        v.frames[i] = FrameData { shapes: m.shapes.clone(), colors: m.colors.clone(), scores: m.scores.clone() };
+        v.frames[i] = FrameData { shapes: m.shapes.clone(), colors: m.colors.clone(), scores: m.scores.clone(), contrast: m.contrast, time: self.build_time };
+        self.build_time = Duration::ZERO;
         let dir = self.tmp.join("built");
         let _ = std::fs::create_dir_all(&dir);
         let bytes = jpeg(&load::pixmap_to_rgba(&m.canvas), 85);
@@ -1422,6 +1576,7 @@ impl Worker {
         v.pass2 = vec![FrameData::default(); v.frames.len()];
         v.pass2_next = 0;
         m.set_target(target, v.bg0, Some(start));
+        self.build_time = Duration::ZERO;
         v.cur = 0;
         self.publish_original();
         self.dirty_status = true;
@@ -1432,7 +1587,8 @@ impl Worker {
     fn finish_pass2(&mut self) {
         let (Some(m), Source::Video(v)) = (&mut self.model, &mut self.source) else { return };
         let i = v.pass2_next;
-        v.pass2[i] = FrameData { shapes: m.shapes.clone(), colors: m.colors.clone(), scores: m.scores.clone() };
+        v.pass2[i] = FrameData { shapes: m.shapes.clone(), colors: m.colors.clone(), scores: m.scores.clone(), contrast: m.contrast, time: self.build_time };
+        self.build_time = Duration::ZERO;
         v.pass2_next += 1;
         let next = v.pass2_next;
         if next < v.frames.len() {
@@ -1781,15 +1937,60 @@ impl Worker {
     // ------------------------------------------------------------ export
 
     fn export_data(&self) -> Result<ExportData, String> {
-        let (Source::Image(src), Some(m)) = (&self.source, &self.model) else {
-            return Err("Load an image first.".into());
+        let Some(m) = &self.model else {
+            return Err("Load a picture or a video first.".into());
         };
-        let _ = src;
+        // A video: the frame on screen.
+        let (stem, shapes, colors, bg) = match &self.source {
+            Source::None => return Err("Load a picture or a video first.".into()),
+            Source::Image(_) => (self.naming().single(), m.shapes.clone(), m.colors.clone(), m.bg),
+            Source::Video(v) => {
+                let i = v.view.min(v.frames.len().saturating_sub(1));
+                let stem = self.naming().frame(i as u64);
+                if self.settings.build_on {
+                    // The picture is every shape of every frame up to this one.
+                    let done = v.frontier.min(v.frames.len());
+                    let mut parts: Vec<&FrameData> = Vec::new();
+                    let mut live = false;
+                    match self.loop_pass {
+                        // "Loop video": the same laps as a render draws.
+                        LoopState::Ready { laps } if self.settings.loop_video && v.pass2.len() == v.frames.len() => {
+                            parts.extend(v.frames.iter());
+                            for _ in 0..laps {
+                                parts.extend(v.pass2.iter());
+                            }
+                            parts.extend(v.pass2[..=i].iter());
+                        }
+                        _ => {
+                            parts.extend(v.frames[..done.min(i + 1)].iter());
+                            live = i >= done;
+                        }
+                    }
+                    let mut shapes = Vec::new();
+                    let mut colors = Vec::new();
+                    for f in parts {
+                        shapes.extend_from_slice(&f.shapes);
+                        colors.extend_from_slice(&f.colors);
+                    }
+                    if live {
+                        shapes.extend_from_slice(&m.shapes);
+                        colors.extend_from_slice(&m.colors);
+                    }
+                    (stem, shapes, colors, v.bg0)
+                } else if i == v.cur {
+                    (stem, m.shapes.clone(), m.colors.clone(), m.bg)
+                } else {
+                    let f = &v.frames[i];
+                    let bg = bg_from(&self.applied.1, &self.read_frame(i)?);
+                    (stem, f.shapes.clone(), f.colors.clone(), bg)
+                }
+            }
+        };
         Ok(ExportData {
-            stem: self.naming().single(),
-            shapes: m.shapes.clone(),
-            colors: m.colors.clone(),
-            bg: m.bg,
+            stem,
+            shapes,
+            colors,
+            bg,
             w: m.w,
             h: m.h,
             out_size: self.settings.out_size,
@@ -1815,14 +2016,15 @@ impl Worker {
         }
     }
 
-    /// Shape count and score of the frame on screen. In video mode the
-    /// playhead can sit on a stored frame that is not in the model.
-    fn shown_stats(&self) -> (usize, Option<f64>) {
-        let live = (self.shape_count(), self.model.as_ref().map(|m| m.score));
+    /// Shape count, score and contrast of the frame on screen. In video
+    /// mode the playhead can sit on a stored frame that is not in the model.
+    fn shown_stats(&self) -> (usize, Option<f64>, f64, Duration) {
+        let live = (self.shape_count(), self.model.as_ref().map(|m| m.score), self.model.as_ref().map_or(0.0, |m| m.contrast), self.build_time);
         let Some(v) = self.video() else { return live };
         let in_model = if self.settings.build_on { v.view == v.frontier } else { v.view == v.cur };
         match v.frames.get(v.view) {
-            Some(f) if !in_model => (f.shapes.len(), f.scores.last().copied()),
+            Some(f) if !in_model && !f.shapes.is_empty() => (f.shapes.len(), f.scores.last().copied(), f.contrast, f.time),
+            Some(_) if !in_model => (0, None, 0.0, Duration::ZERO),
             _ => live,
         }
     }
@@ -1835,7 +2037,7 @@ impl Worker {
             .enumerate()
             .map(|(i, f)| {
                 let live = (!build_on && i == v.cur) || (build_on && i == v.frontier);
-                let (n, full) = if live { (self.shape_count(), self.full()) } else { (f.shapes.len(), self.is_full(f.shapes.len(), f.scores.last().copied())) };
+                let (n, full) = if live { (self.shape_count(), self.full()) } else { (f.shapes.len(), self.settings.done(f.shapes.len(), f.scores.last().copied(), f.contrast)) };
                 if build_on && i < v.frontier || full {
                     '2'
                 } else if n > 0 {
@@ -1902,6 +2104,14 @@ impl Worker {
             "build_paused": self.building_paused(),
             "shapes": shown.0,
             "score": shown.1,
+            // Seconds spent adding this picture's shapes.
+            "time": shown.3.as_secs_f64(),
+            // Share of the picture's contrast that is matched, in percent.
+            "matched": shown.1.filter(|_| shown.2 > 0.0).map(|sc| ((1.0 - sc / shown.2) * 100.0).clamp(0.0, 100.0)),
+            // The score "Stop at match" stops this picture at, and whether
+            // that is the fixed floor and not the percentage.
+            "stop_score": self.settings.stop_score(shown.2),
+            "stop_floor": self.settings.stop_floor > 0.0 && self.settings.stop_score(shown.2).is_some_and(|t| t <= self.settings.stop_floor),
             "gpu": m.map(|m| m.gpu_name().to_string()),
             "has_work": self.has_work(),
             "loading": loading,

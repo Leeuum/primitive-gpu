@@ -9,6 +9,7 @@
 //!      the chain. A chain stops after `age` tries without improvement.
 //!   3. The best chain's shape is added to the canvas.
 
+use crate::constraints::{Constraints, Rules};
 use crate::core::{Metric, compute_color, delta_lines, difference_full, difference_partial, draw_lines, score_of};
 use crate::gpu::{Gpu, GpuCand, GpuDesc, GpuSpan, SLOTS};
 use std::collections::VecDeque;
@@ -36,8 +37,8 @@ impl State {
         }
     }
 
-    fn do_move(&mut self, w: i32, h: i32, rng: &mut Rng) {
-        self.shape.mutate(w, h, rng);
+    fn do_move(&mut self, w: i32, h: i32, rng: &mut Rng, rules: Option<&Rules>) {
+        self.shape.mutate_with(w, h, rng, rules);
         if self.mutate_alpha {
             self.alpha = (self.alpha + rng.intn(21) - 10).clamp(1, 255);
         }
@@ -208,8 +209,9 @@ where
     (Batch { states, span_chunks: Vec::new(), descs: Vec::new(), cands, parts: counts.to_vec() }, cpu)
 }
 
-/// What decides the random shapes of one step: (shape mode, alpha, how many).
-type RandomKey = (i32, i32, usize);
+/// What decides the random shapes of one step: (shape mode, alpha, how
+/// many, the creative rules).
+type RandomKey = (i32, i32, usize, Option<Rules>);
 
 /// How many shapes go in each batch of the random phase.
 fn random_counts(n: usize) -> Vec<usize> {
@@ -222,14 +224,16 @@ fn random_counts(n: usize) -> Vec<usize> {
 /// jobs, with the CPU seconds spent. Needs one seed per `random_counts`
 /// entry. Random shapes do not depend on the canvas, so this can run before
 /// the step it is for.
-fn random_jobs(w: i32, h: i32, (shape_type, alpha, n): RandomKey, seeds: &[u64]) -> (Vec<Batch>, f64) {
+fn random_jobs(w: i32, h: i32, key: &RandomKey, seeds: &[u64]) -> (Vec<Batch>, f64) {
+    let (shape_type, alpha, n) = (key.0, key.1, key.2);
+    let rules = key.3.as_ref();
     let counts = random_counts(n);
     let mid = counts.len().div_ceil(2);
     let mut jobs = Vec::new();
     let mut cpu = 0.0;
     for (cs, ss) in [(&counts[..mid], &seeds[..mid]), (&counts[mid..], &seeds[mid..])] {
         if !cs.is_empty() {
-            let (b, t) = make_cands(w, h, cs, ss, false, |_, _, rng| State::new(Shape::random(shape_type, w, h, rng), alpha));
+            let (b, t) = make_cands(w, h, cs, ss, false, |_, _, rng| State::new(Shape::random_with(shape_type, w, h, rng, rules), alpha));
             jobs.push(b);
             cpu += t;
         }
@@ -253,6 +257,14 @@ fn blank_current(w: i32, h: i32, bg: [u8; 4]) -> Vec<u8> {
     let premul = |c: u8| (c as u32 * bg[3] as u32 / 255) as u8;
     let px = [premul(bg[0]), premul(bg[1]), premul(bg[2]), bg[3]];
     px.iter().copied().cycle().take((w * h * 4) as usize).collect()
+}
+
+/// The score of a flat canvas in the picture's average color: how much
+/// contrast the picture has. It does not depend on the background setting
+/// or on what is drawn so far.
+fn contrast_of(m: Metric, target: &[u8], w: i32, h: i32) -> f64 {
+    let flat = blank_current(w, h, crate::load::average_color(target));
+    score_of(m, difference_full(m, target, &flat), w, h)
 }
 
 /// An output canvas filled with the background color.
@@ -326,6 +338,8 @@ pub struct Model {
     current: Vec<u8>,
     total: u64,
     pub score: f64,
+    /// `contrast_of` the target picture. Only for the caller's stop rule.
+    pub contrast: f64,
     pub shapes: Vec<Shape>,
     pub colors: Vec<[u8; 4]>,
     pub scores: Vec<f64>,
@@ -335,6 +349,9 @@ pub struct Model {
     scratch: Scratch,
     pub counter: usize,
     cfg: SearchConfig,
+    /// The creative rules, and what they come to for the current step.
+    cons: Constraints,
+    rules: Option<Rules>,
     pub times: Timings,
     pub check: CheckStats,
     check_pending: [Option<(Vec<i64>, Vec<usize>)>; SLOTS],
@@ -358,6 +375,7 @@ impl Model {
         let total = difference_full(m, &target, &current);
         let gpu = Gpu::new(&target, &current, w as u32, h as u32, m)?;
         let canvas = Self::new_canvas(sw.max(1), sh.max(1), bg);
+        let contrast = contrast_of(m, &target, w, h);
         Ok(Model {
             w,
             h,
@@ -369,6 +387,7 @@ impl Model {
             current,
             total,
             score: score_of(m, total, w, h),
+            contrast,
             shapes: Vec::new(),
             colors: Vec::new(),
             scores: Vec::new(),
@@ -378,6 +397,8 @@ impl Model {
             scratch: Scratch::default(),
             counter: 0,
             cfg,
+            cons: Constraints::default(),
+            rules: None,
             times: Timings::default(),
             check: CheckStats::default(),
             check_pending: Default::default(),
@@ -420,6 +441,11 @@ impl Model {
         self.cfg = SearchConfig { check: self.cfg.check, gpu_draw: self.cfg.gpu_draw, metric: self.cfg.metric, ..cfg };
     }
 
+    /// Set the creative rules for the shapes found from now on.
+    pub fn set_constraints(&mut self, cons: Constraints) {
+        self.cons = cons;
+    }
+
     /// Swap in a new picture of the same size (the next frame of a video)
     /// and start again from `start` (the working canvas and the preview
     /// canvas), or from the background color when `start` is None. Clears
@@ -428,6 +454,7 @@ impl Model {
     pub fn set_target(&mut self, target: Vec<u8>, bg: [u8; 4], start: Option<(Vec<u8>, Pixmap)>) {
         assert_eq!(target.len(), self.target.len(), "set_target needs a picture of the same size");
         self.target = target;
+        self.contrast = contrast_of(self.cfg.metric, &self.target, self.w, self.h);
         self.bg = bg;
         self.reset(start);
         self.gpu.set_target(&self.target, &self.current);
@@ -651,7 +678,9 @@ impl Model {
         let mut energies = Vec::with_capacity(n);
         if self.joined {
             let t0 = Instant::now();
-            let key: RandomKey = (shape_type, alpha, n);
+            let key: RandomKey = (shape_type, alpha, n, self.rules.clone());
+            // The rules can depend on the shape number (shrinking size).
+            let next_key: RandomKey = (shape_type, alpha, n, self.cons.resolve(w, h, self.shapes.len() + 1));
             let seed_count = random_counts(n).len();
             // Use the shapes made in the background during the last step,
             // if they are of the kind this step needs.
@@ -659,7 +688,7 @@ impl Model {
                 Some((k, rx)) if k == key => rx.recv().expect("background shape maker stopped"),
                 _ => {
                     let seeds: Vec<u64> = (0..seed_count).map(|_| self.rng.next_u64()).collect();
-                    random_jobs(w, h, key, &seeds)
+                    random_jobs(w, h, &key, &seeds)
                 }
             };
             // Start on the random shapes of the next step now, on the other
@@ -667,10 +696,11 @@ impl Model {
             // are ready long before this step's hill climb ends.
             let seeds: Vec<u64> = (0..seed_count).map(|_| self.rng.next_u64()).collect();
             let (tx, rx) = mpsc::sync_channel(1);
+            let job_key = next_key.clone();
             rayon::spawn(move || {
-                let _ = tx.send(random_jobs(w, h, key, &seeds));
+                let _ = tx.send(random_jobs(w, h, &job_key, &seeds));
             });
-            self.pregen = Some((key, rx));
+            self.pregen = Some((next_key, rx));
             let pt = self.phase_times();
             pt.make += cpu;
             pt.prepare += t0.elapsed().as_secs_f64();
@@ -684,12 +714,13 @@ impl Model {
             return (states, energies);
         }
         let mut inflight: VecDeque<(usize, Vec<State>)> = VecDeque::new();
+        let rules = self.rules.clone();
         for p in 0..parts {
             let cnt = per.min(n - (p * per).min(n));
             if cnt == 0 {
                 break;
             }
-            let b = self.prepare(cnt, |_, rng| State::new(Shape::random(shape_type, w, h, rng), alpha));
+            let b = self.prepare(cnt, |_, rng| State::new(Shape::random_with(shape_type, w, h, rng, rules.as_ref()), alpha));
             if inflight.len() == SLOTS {
                 let (slot, st) = inflight.pop_front().unwrap();
                 states.extend(st);
@@ -714,9 +745,10 @@ impl Model {
             return None;
         }
         let parents: Vec<State> = live.iter().map(|&i| chains[i].state).collect();
+        let rules = self.rules.clone();
         let b = self.prepare(live.len() * k, |j, rng| {
             let mut s = parents[j / k];
-            s.do_move(w, h, rng);
+            s.do_move(w, h, rng, rules.as_ref());
             s
         });
         let states = self.submit(g, b);
@@ -730,6 +762,7 @@ impl Model {
     fn climb_joined(&mut self, chains: &mut [Chain]) {
         let (w, h, k, max_age) = (self.w, self.h, self.cfg.k.max(1), self.cfg.age);
         let groups = SLOTS.min(chains.len());
+        let rules = self.rules.clone();
         loop {
             let live: Vec<Vec<usize>> = (0..groups)
                 .map(|g| (g..chains.len()).step_by(groups).filter(|&i| chains[i].age < max_age).collect())
@@ -742,7 +775,7 @@ impl Model {
             let counts: Vec<usize> = live.iter().map(|l| l.len() * k).collect();
             let b = self.prepare_cands(&counts, |g, j, rng| {
                 let mut s = parents[g][j / k];
-                s.do_move(w, h, rng);
+                s.do_move(w, h, rng, rules.as_ref());
                 s
             });
             let batch = self.submit(0, b);
@@ -805,6 +838,7 @@ impl Model {
     /// of candidates scored.
     pub fn step(&mut self, shape_type: i32, alpha: i32, repeat: usize) -> usize {
         self.counter = 0;
+        self.rules = self.cons.resolve(self.w, self.h, self.shapes.len());
         self.gpu_draw_now = self.cfg.gpu_draw && Shape::gpu_supported(shape_type);
         // Curves (mode 6) cost much more CPU time per candidate than the
         // other kinds, so they keep the older scheme: every batch is prepared

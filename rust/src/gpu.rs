@@ -160,10 +160,27 @@ impl Gpu {
             cache: None,
         });
         let layout = pipeline.get_bind_group_layout(0);
-        let raster_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("raster_score"),
-            source: wgpu::ShaderSource::Wgsl(format!("{head}{}", include_str!("raster_score.wgsl")).into()),
-        });
+        // wgpu normally adds a counter to every shader loop so that no loop
+        // can run forever. For raster_score.wgsl that counter cost 15-40 % of
+        // the run time in most shape modes, so it is turned off here for this
+        // shader only. Bounds checks on buffer and array reads stay on.
+        let mut checks = wgpu::ShaderRuntimeChecks::checked();
+        checks.force_loop_bounding = false;
+        // SAFETY: every loop in raster_score.wgsl and common.wgsl ends for any
+        // contents of a GpuCand (NaN, infinite or huge numbers, any y0 and
+        // y1): rows are clamped to the image in main(), columns are walked in
+        // image columns, and the curve's piece count is clamped to 128. Any
+        // new or changed loop there must have a bound that does not depend on
+        // unchecked candidate data.
+        let raster_module = unsafe {
+            device.create_shader_module_trusted(
+                wgpu::ShaderModuleDescriptor {
+                    label: Some("raster_score"),
+                    source: wgpu::ShaderSource::Wgsl(format!("{head}{}", include_str!("raster_score.wgsl")).into()),
+                },
+                checks,
+            )
+        };
         let raster_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("raster_score"),
             layout: None,

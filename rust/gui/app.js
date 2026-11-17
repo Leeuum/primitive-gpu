@@ -29,9 +29,9 @@ function popup(text, { key = null, ok = "Go on", cancel = "Cancel" } = {}) {
     }, { once: true });
   });
 }
-async function ask(key, text) {
+async function ask(key, text, ok = "Go on") {
   if (localStorage.getItem(SKIP + key)) return true;
-  return popup(text, { key });
+  return popup(text, { key, ok });
 }
 function tell(text) { return popup(text, { ok: "OK", cancel: null }); }
 function showAskReset() { $("ask-reset").hidden = skipped().length === 0; }
@@ -40,6 +40,7 @@ showAskReset();
 let ws = null;
 let st = null;               // newest status from the program
 let picUrl = null;
+let picBlob = null;          // the picture on screen, kept for Snapshot
 let myRender = false;        // this page pressed Render
 let downloaded = null;       // render file this page already downloaded
 let lastEdit = 0;            // time of the last settings edit on this page
@@ -52,7 +53,7 @@ function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws`);
   ws.binaryType = "blob";
-  ws.onopen = () => { connected = true; localError = null; render(); };
+  ws.onopen = () => { connected = true; localError = null; sendMask(); render(); };
   ws.onclose = () => {
     connected = false;
     localError = "Lost the connection to primitive-gui. Trying again…";
@@ -65,7 +66,8 @@ function connect() {
       render();
     } else {
       const url = URL.createObjectURL(ev.data);
-      $("picture").onload = () => { if (picUrl && picUrl !== url) URL.revokeObjectURL(picUrl); picUrl = url; };
+      const blob = ev.data;
+      $("picture").onload = () => { if (picUrl && picUrl !== url) URL.revokeObjectURL(picUrl); picUrl = url; picBlob = blob; };
       $("picture").src = url;
     }
   };
@@ -77,9 +79,9 @@ function send(obj) {
 
 // -------------------------------------------------------------- settings
 
-const NUM = ["count", "min_count", "mode", "alpha", "work_size", "out_w", "out_h", "repeat", "chains", "random", "age", "k", "frame_digits", "frame_start"];
-const FLOAT = ["seq_fps"];
-const TEXT = ["background", "metric", "out_preset", "export_fmt", "name_pattern"];
+const NUM = ["count", "min_count", "mode", "alpha", "work_size", "out_w", "out_h", "repeat", "chains", "random", "age", "k", "frame_digits", "frame_start", "c_grid"];
+const FLOAT = ["stop_floor", "seq_fps", "c_angle_deg", "c_angle_step", "c_x", "c_y", "c_min_size", "c_max_size", "c_min_ratio", "c_max_ratio"];
+const TEXT = ["background", "metric", "c_angle", "c_area", "out_preset", "export_fmt", "name_pattern"];
 const ALL = NUM.concat(FLOAT, TEXT);
 
 const FORMATS = {
@@ -112,11 +114,12 @@ function readSettings() {
     s[k] = Number.isFinite(v) ? v : (st && st.settings ? st.settings[k] : 0);
   }
   for (const k of TEXT) s[k] = $(k).value.trim();
-  const ts = parseFloat($("target_score").value);
-  s.target_score = Number.isFinite(ts) && ts > 0 ? ts : 0;
+  const sm = parseFloat($("stop_match").value);
+  s.stop_match = Number.isFinite(sm) && sm > 0 && sm < 100 ? sm : 0;
   s.build_on = document.querySelector('input[name=frames][value=build]').checked;
   s.realtime = $("realtime").checked;
   s.loop_video = $("loop_video").checked;
+  s.c_shrink = $("c_shrink").checked;
   // Unticked "Manual seed" sends an empty seed: a new random one each Restart.
   s.seed = $("seed_lock").checked ? $("seed").value.trim() : "";
   return s;
@@ -135,9 +138,9 @@ function fillSettings(s) {
     if (el === document.activeElement || typing) continue;
     if (String(el.value) !== String(s[k])) el.value = s[k];
   }
-  const tsEl = $("target_score");
+  const tsEl = $("stop_match");
   if (tsEl !== document.activeElement && !typing) {
-    const v = s.target_score > 0 ? String(s.target_score) : "";
+    const v = s.stop_match > 0 ? String(s.stop_match) : "";
     if (tsEl.value !== v) tsEl.value = v;
   }
   if (!typing) {
@@ -146,9 +149,12 @@ function fillSettings(s) {
     document.querySelector(`input[name=frames][value=${s.build_on ? "build" : "fresh"}]`).checked = true;
     $("realtime").checked = !!s.realtime;
     $("loop_video").checked = !!s.loop_video;
+    $("c_shrink").checked = !!s.c_shrink;
+    $("c_angle_deg-range").value = ((s.c_angle_deg % 180) + 180) % 180;
     if (/^#?[0-9a-fA-F]{6}$/.test(s.background)) $("background-pick").value = "#" + s.background.replace("#", "");
   }
   fillSeed(s, typing);
+  showRuleRows();
 }
 
 // Seed: unticked shows the seed in use, greyed out. Ticked keeps the number
@@ -192,22 +198,36 @@ $("settings-file").addEventListener("change", async () => {
     tell(`${f.name} is not a settings file.`);
     return;
   }
+  if ((await applySettings(loaded)) === "none") tell(`${f.name} has no settings in it.`);
+});
+
+// Puts loaded settings into the panel and sends them. A setting that is
+// missing, or of the wrong type, keeps its current value. Gives "none" when
+// nothing matched, "cancel" when the user said no, "ok" when applied.
+async function applySettings(loaded) {
   const cur = readSettings();
   const known = Object.keys(cur).filter((k) => loaded && k in loaded && typeof loaded[k] === typeof cur[k]);
-  if (!known.length) { tell(`${f.name} has no settings in it.`); return; }
+  if (!known.length) return "none";
   const next = { ...cur };
   for (const k of known) next[k] = loaded[k];
   // A file type that this kind of source does not offer keeps the current one.
   if (![...$("export_fmt").options].some((o) => o.value === next.export_fmt)) next.export_fmt = cur.export_fmt;
   if (next.build_on !== cur.build_on && st && st.has_work &&
-      !(await ask("switch-frames", "These settings switch how video frames are built. That clears the shapes of every frame. Go on?"))) return;
+      !(await ask("switch-frames", "These settings switch how video frames are built. That clears the shapes of every frame. Go on?"))) return "cancel";
   lastEdit = 0;
   fillSettings(next);
   sendSettings();
-});
-$("target_score").addEventListener("change", sendSettings);
+  return "ok";
+}
+$("stop_match").addEventListener("change", sendSettings);
+// An empty title stops the browser's own "select a valid value" popup.
+for (const el of document.querySelectorAll("input")) if (!el.title) el.setAttribute("title", "");
 $("realtime").addEventListener("change", sendSettings);
 $("loop_video").addEventListener("change", sendSettings);
+$("c_shrink").addEventListener("change", sendSettings);
+$("c_angle").addEventListener("input", showRuleRows);
+$("c_area").addEventListener("input", showRuleRows);
+$("c_angle_deg-range").addEventListener("input", () => { $("c_angle_deg").value = $("c_angle_deg-range").value; sendSettings(); });
 $("seed").addEventListener("change", sendSettings);
 $("seed_lock").addEventListener("change", () => { $("seed").disabled = !$("seed_lock").checked; sendSettings(); });
 // Typing a name pattern updates the example name shortly after.
@@ -394,6 +414,27 @@ $("render").onclick = async () => {
   render();
 };
 
+// A video: save only the frame on screen as one picture.
+let savingFrame = false;
+$("save-frame").onclick = async () => {
+  if (!st || st.kind !== "video" || savingFrame) return;
+  const seq = $("export_fmt").value;
+  const fmt = seq === "jpg-seq" ? "jpg" : seq === "svg-seq" ? "svg" : "png";
+  savingFrame = true;
+  render();
+  try {
+    const r = await fetch(`/export?fmt=${fmt}`);
+    if (!r.ok) throw new Error(await r.text());
+    const blob = await r.blob();
+    const m = (r.headers.get("content-disposition") || "").match(/filename="([^"]+)"/);
+    saveBlob(blob, m ? m[1] : `frame.${fmt}`);
+  } catch (e) {
+    localError = `Save frame failed: ${e.message}`;
+  }
+  savingFrame = false;
+  render();
+};
+
 function saveBlob(blob, name) {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
@@ -417,6 +458,91 @@ hold.addEventListener("pointerup", () => showOriginal(false));
 hold.addEventListener("pointercancel", () => showOriginal(false));
 hold.addEventListener("contextmenu", (e) => e.preventDefault());
 
+// ----------------------------------------------------------------- slots
+// Snapshot keeps the picture on screen, the settings and the painted area
+// in a slot on this page (lost on reload). Clicking a slot, or pressing its
+// number key, shows its picture and puts its settings back. The same key,
+// a click on the same slot, or Esc goes back to the live picture.
+const SLOTS = 8;
+const slots = new Array(SLOTS).fill(null);
+let viewing = -1;            // slot on screen, -1 = the live picture
+
+function drawSlots() {
+  const bar = $("slots");
+  bar.innerHTML = "";
+  bar.hidden = !slots.some(Boolean);
+  slots.forEach((s, i) => {
+    if (!s) return;
+    const b = document.createElement("div");
+    b.className = "slot" + (i === viewing ? " on" : "");
+    b.title = `Slot ${i + 1}: ${s.label}. Click or press ${i + 1} to view it and use its settings.`;
+    b.innerHTML = `<span class="slot-num">${i + 1}</span><img alt=""><button class="slot-x" title="Empty this slot">&times;</button>`;
+    b.querySelector("img").src = s.url;
+    b.onclick = () => openSlot(i);
+    b.querySelector(".slot-x").onclick = (e) => { e.stopPropagation(); emptySlot(i); };
+    bar.append(b);
+  });
+  const v = $("slot-view");
+  if (viewing >= 0) { v.src = slots[viewing].url; v.hidden = false; } else v.hidden = true;
+}
+
+function snapshot() {
+  if (!st || !st.ready || !picBlob) return;
+  const i = slots.indexOf(null);
+  if (i < 0) { tell(`All ${SLOTS} slots are full. Empty one with its × first.`); return; }
+  let mask = null;
+  if (maskData) {
+    mask = document.createElement("canvas");
+    mask.width = maskData.width; mask.height = maskData.height;
+    mask.getContext("2d").drawImage(maskData, 0, 0);
+  }
+  slots[i] = { url: URL.createObjectURL(picBlob), settings: readSettings(), mask,
+               invert: $("mask-invert").checked, label: st.video ? `frame ${st.video.view + 1}` : "picture" };
+  drawSlots();
+}
+
+function emptySlot(i) {
+  if (!slots[i]) return;
+  URL.revokeObjectURL(slots[i].url);
+  slots[i] = null;
+  if (viewing === i) viewing = -1;
+  drawSlots();
+}
+
+function closeSlot() { if (viewing >= 0) { viewing = -1; drawSlots(); } }
+
+async function openSlot(i) {
+  const s = slots[i];
+  if (!s) return;
+  if (viewing === i) { closeSlot(); return; }
+  if (st && st.render) { tell("A render is running. Cancel it first."); return; }
+  if (!(await ask("slot-load", `Viewing slot ${i + 1} replaces your current settings and painted area with the ones saved in the slot. Go on?`, "OK"))) return;
+  if ((await applySettings(s.settings)) === "cancel") return;
+  maskData = null;
+  if (s.mask) {
+    maskData = document.createElement("canvas");
+    maskData.width = s.mask.width; maskData.height = s.mask.height;
+    maskData.getContext("2d").drawImage(s.mask, 0, 0);
+  }
+  $("mask-invert").checked = s.invert;
+  sendMask();
+  drawOverlay();
+  viewing = i;
+  drawSlots();
+}
+
+$("snapshot").onclick = snapshot;
+
+// Number keys 1 to 8 open a slot, Esc goes back to the live picture.
+// Not while the cursor is in a setting or a popup is open.
+document.addEventListener("keydown", (e) => {
+  if (e.ctrlKey || e.altKey || e.metaKey || $("ask").open) return;
+  if (e.target.closest && e.target.closest("input:not([type=checkbox]), select, textarea")) return;
+  if (e.key === "Escape" && viewing >= 0) { e.preventDefault(); closeSlot(); return; }
+  const n = parseInt(e.key, 10);
+  if (n >= 1 && n <= SLOTS && String(n) === e.key && slots[n - 1]) { e.preventDefault(); openSlot(n - 1); }
+});
+
 // -------------------------------------------------------------- timeline
 
 const tl = $("timeline");
@@ -435,6 +561,26 @@ function seekAt(e) {
 tl.addEventListener("pointerdown", (e) => { seeking = true; tl.setPointerCapture(e.pointerId); seekAt(e); });
 tl.addEventListener("pointermove", (e) => { if (seeking) seekAt(e); });
 tl.addEventListener("pointerup", (e) => { seeking = false; seekAt(e); });
+
+// Arrow keys: left / right move one frame, up jumps to the last frame,
+// down to the first. Not while the cursor is in a setting, so the keys
+// still change that setting.
+let keyFrame = 0, keyTime = 0;
+document.addEventListener("keydown", (e) => {
+  if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key)) return;
+  if (!st || !st.video || st.render || e.ctrlKey || e.altKey || e.metaKey || $("ask").open) return;
+  if (e.target.closest && e.target.closest("input:not([type=checkbox]), select, textarea")) return;
+  e.preventDefault();
+  const v = st.video;
+  const last = st.settings.build_on ? Math.min(v.frames - 1, v.frontier) : v.frames - 1;
+  // Held key: count from the last frame asked for, not the last one shown.
+  const now = Date.now();
+  const from = now - keyTime < 500 ? keyFrame : v.view;
+  const f = e.key === "ArrowUp" ? last : e.key === "ArrowDown" ? 0 : from + (e.key === "ArrowRight" ? 1 : -1);
+  keyFrame = Math.max(0, Math.min(last, f));
+  keyTime = now;
+  send({ t: "seek", frame: keyFrame });
+});
 
 function drawTimeline() {
   const v = st.video;
@@ -485,6 +631,13 @@ function duration(sec) {
   return `${s} s`;
 }
 
+// Build time on the status line: tenths of a second, to compare settings.
+function buildTime(sec) {
+  if (sec < 60) return `${sec.toFixed(1)} s`;
+  const m = Math.floor(sec / 60);
+  return `${m} min ${(sec - m * 60).toFixed(1).padStart(4, "0")} s`;
+}
+
 // ---------------------------------------------------------------- render
 
 function render() {
@@ -503,6 +656,7 @@ function render() {
   view.classList.toggle("empty", !st.ready);
   $("drop-hint").hidden = !!st.ready || !!st.loading;
   $("picture").hidden = !st.ready;
+  placeOverlay();
 
   if (st.loading) {
     $("busy").hidden = false;
@@ -519,12 +673,19 @@ function render() {
   pb.disabled = !(st.video && (st.video.frontier < st.video.frames || rendering));
   pb.textContent = st.build_paused ? "Resume building" : "Pause building";
   $("hold-original").disabled = !ready;
+  $("snapshot").disabled = !ready;
+  const sf = $("save-frame");
+  sf.hidden = !(st.ready && isVideo);
+  sf.disabled = !ready || rendering || savingFrame;
+  sf.textContent = savingFrame ? "Saving…" : "Save frame";
   $("open").disabled = rendering;
 
   let info = "";
   if (st.ready) {
     const parts = [`shapes ${st.shapes}/${s.count}`];
-    if (st.score != null) parts.push(`score ${st.score.toFixed(4)}` + (s.target_score > 0 ? ` (stop at ${s.target_score})` : ""));
+    if (st.score != null) parts.push(`score ${st.score.toFixed(4)}`);
+    if (st.matched != null) parts.push(`match ${Math.floor(st.matched)}%` + (st.stop_score == null ? "" : st.stop_floor ? ` (flat picture: stops at score ${st.stop_score.toFixed(3)})` : ` (stop at ${s.stop_match}%)`));
+    if (st.time != null && st.shapes > 0) parts.push(`time ${buildTime(st.time)}`);
     if (isVideo) parts.push(`frame ${st.video.view + 1}/${st.video.frames}`);
     if (isVideo && s.build_on && st.video.frontier < st.video.frames) parts.push(st.build_paused ? `paused at frame ${st.video.frontier + 1}` : `building frame ${st.video.frontier + 1}`);
     if (isVideo && st.video.loop_prep) parts.push(st.video.pass2_next < st.video.frames
@@ -610,105 +771,51 @@ function render() {
   }
 }
 
-window.addEventListener("resize", () => { if (st && st.video) drawTimeline(); });
+window.addEventListener("resize", () => { if (st && st.video) drawTimeline(); placeOverlay(); });
 connect();
 
 // ---- Help boxes ------------------------------------------------------------
-// Rest the mouse on a setting for a moment and a box with notes about it
-// opens beside the panel. Each entry: [title, what it does, tip, example].
+// Rest the mouse on a setting for a moment and a box about it opens beside
+// the panel. Each entry: [title, what it does] or, for a number, [title, what
+// it does, what higher means, what lower means].
 const TIPS = {
-  count: ["Shapes",
-    "How many shapes make up the picture. For a video, this is the number of shapes in each frame.",
-    "Around 100 gives a bold, abstract look. 500 to 2000 starts to look like the photo. You can raise it while a picture is running and it carries on from where it is.",
-    "250 triangles is a good first look at a portrait."],
-  target_score: ["Stop at score",
-    "Stops a picture early once its score is this low or lower. A lower score means closer to the original. The Shapes number is then the most shapes a picture may use. Leave it empty to always use the full number of shapes.",
-    "For a video, each frame stops at the same quality, so easy frames use fewer shapes and busy frames use more. Each shape improves the score less than the one before, so a slightly lower target can take many more shapes. Watch the score while a picture runs to find a good value. With \"build on\", a frame that barely changes may need almost no new shapes.",
-    "Try a value a little below the score you see after 250 shapes, such as 0.04."],
-  min_count: ["Fewest shapes",
-    "Each picture gets at least this many shapes before Stop at score may stop it. It does nothing when Stop at score is empty.",
-    "Dark frames reach a low score with very few shapes, because the score measures differences in brightness and a dark frame has small differences even where it has detail. A minimum keeps those frames from looking empty.",
-    "Set it to the shape count where a dark frame starts to look right, such as 50."],
-  mode: ["Mode",
-    "The kind of shape that is used. Combo picks the best of all kinds for each new shape.",
-    "Triangles and polygons give a cut-glass look. Ellipses and circles look soft, like paint dabs. Curve draws thin strokes and is the slowest mode.",
-    "Rotated rectangle with a low alpha looks like brush strokes."],
-  "alpha-range": ["Alpha",
-    "How see-through each shape is. 255 is solid, 1 is almost invisible.",
-    "0 lets the program choose a different value for each shape. Low values give soft, layered pictures but need more shapes. High values give flat, poster-like pictures.",
-    "128 (half see-through) is the default and suits most pictures."],
-  background: ["Background",
-    "The color of the empty canvas before the first shape is drawn.",
-    "Leave it empty to use the average color of the picture, which usually gives the best result. Type a hex code or use the color picker for a set color. Restart to see the change.",
-    "#000000 for black, #ffffff for white."],
-  "work-range": ["Working size",
-    "The picture is shrunk to this size (long side, in pixels) while the program searches for shapes.",
-    "Bigger values find smaller details but each shape takes longer. It does not change how sharp the result is: the final picture is drawn again at the output size. Restart to apply.",
-    "256 is fast. 512 suits large or detailed pictures."],
-  out_preset: ["Output size",
-    "The size of the exported picture or video.",
-    "The shapes are drawn again at this size, so a big output stays sharp. It does not change which shapes are found. Custom lets you type an exact width and height.",
-    "Pick 4K for a print or a wallpaper."],
-  repeat: ["Extra shapes per step",
-    "After each new shape, the program tries to add up to this many more by changing that last shape a little.",
-    "This is faster than a full search for every shape, but the extra shapes are a bit worse. It stops early when an extra shape does not help. 0 turns it off.",
-    "Try 2 or 3 when you want many shapes quickly."],
-  "video-mode": ["Video frames",
-    "How each frame of a video or image sequence is made.",
-    "Fresh: every frame starts from an empty canvas, so each frame is its own picture and the shapes jump around. Build on: new shapes are drawn on top of the previous frame, so the picture changes smoothly and slowly turns into the next frame.",
-    "Build on looks good for slow camera moves."],
-  realtime: ["Build in real time",
-    "Each frame gets shapes for exactly as long as it lasts in the video, then the next frame starts. The build runs at playback speed, so a scene change wipes in while you watch and motion leaves trails. The render saves the same shapes you saw.",
-    "Shapes is then the most shapes a frame may get; set it high so the clock decides. The other search settings choose the look: fast settings give many rough shapes per frame, slow settings give few careful ones. The result depends on how fast the computer is at that moment. Frames that are not built yet when you press Render are built at the same speed.",
-    "Press Play, watch the build, then Render when the last frame is done."],
-  loop_video: ["Loop video",
-    "Makes a video that joins up when it plays in a loop. The first frame is drawn on top of the last frame's picture instead of a plain color, so the end turns into the start like any other two frames.",
-    "When the last frame is built, every frame is built a second time. The second build starts on the last frame's picture, so the search picks shapes that suit it. This takes as long as the first build. Then the preview is drawn again and the render saves the looping version.",
-    "Build a short clip in real time, tick this, and watch the jump from the end to the start."],
-  seq_fps: ["Frame rate",
-    "How many pictures of the image sequence are shown each second.",
-    "Pictures have no frame rate of their own, so you choose it here. It changes playback and the exported video length.",
-    "24 for a film look, 12 for a stop-motion look."],
-  chains: ["Chains",
-    "How many separate searches run side by side for each new shape. The best result wins.",
-    "More chains find better shapes but each shape takes longer.",
-    "Default 16."],
-  random: ["Random tries per chain",
-    "How many random shapes each chain looks at before it starts to improve the best one.",
-    "More tries give each chain a better starting point. Lower it for speed.",
-    "Default 1000."],
-  age: ["Age",
-    "How many changes in a row a chain may try with no improvement before it stops.",
-    "Higher values let a chain polish its shape for longer. Lower values are faster but the shapes are rougher.",
-    "Default 100."],
-  k: ["Mutations per round",
-    "How many small changes each chain tries at the same time in each round.",
-    "The graphics card checks them all at once, so a higher value can give better shapes at almost no extra time.",
-    "Default 32."],
-  metric: ["Score",
-    "How the program measures the gap between the drawing and the original.",
-    "Squared gaps: big mistakes count much more than small ones, so the program chases bright spots and fine detail. Plain gaps: every mistake counts the same, so flat areas stay cleaner and the shapes look bolder, more like a poster. The two give different score numbers, so set Stop at score again after you switch. Restart to apply.",
-    "Try Plain gaps with triangles or rectangles."],
-  seed: ["Seed",
-    "The starting number for the random choices.",
-    "The box shows the seed of the current picture. With Manual seed off, each Restart picks a new one. Turn Manual seed on to keep the number, or to type your own; the same seed and settings give the same result again. Restart to apply.",
-    "Restart until you like the result, then tick Manual seed and Save the settings."],
-  export_fmt: ["File type",
-    "The kind of file that Render makes.",
-    "PNG keeps every pixel exact. JPG is smaller. SVG keeps the shapes as shapes, so you can scale it to any size or edit it in Inkscape or Illustrator. For a video, the sequence types save one file per frame in a folder.",
-    "Use SVG to print very large."],
-  name_pattern: ["File name",
-    "The name of the saved file. The tags in curly brackets are replaced with real values.",
-    "{name} is the name of the source file, {shapes} the shape count, {mode} the shape kind, {date} and {time} when it was saved, {frame} the frame number. A file is never overwritten: -2, -3 is added instead.",
-    "{name}-{mode}-{shapes} gives owl-triangle-250.png."],
-  frame_digits: ["Frame digits",
-    "How many digits the frame number has. Short numbers get zeros in front.",
-    "Most editing programs need the zeros to put the frames in the right order. 0 means no zeros are added.",
-    "4 gives 0001, 0002 … 0120."],
-  frame_start: ["First frame",
-    "The number of the first frame in the file names.",
-    "Some programs expect frames to start at 0, others at 1.",
-    "1 gives 0001 as the first file."],
+  count: ["Shapes","How many shapes make up the picture. For a video, this is the number per frame. With \"build on\", it is the number of new shapes that each frame adds.","Closer to the photo, but slower.","Bolder and more abstract."],
+  stop_match: ["Stop at match","Each picture stops as soon as this much of it is matched, or at the Shapes number. 0% is a flat canvas in the picture's average color, 100% is the original. The status line shows the match of the picture on screen. Off: every frame gets the same number of shapes. On: every frame ends up equally finished, so simple frames use few shapes and take little time, and detailed frames use many. A dark frame counts the same as a bright one. A nearly flat frame stops early, so shapes do not chase noise. Try 70. Empty: off.","Takes more time, mostly on detailed frames. The last few percent cost the most shapes.","Stops sooner. Detailed frames save the most time."],
+  stop_floor: ["Lowest score","Stop at match never asks a picture for a score below this number. It is in the score units of the status line. It is for dark or nearly flat frames: their last bit of contrast is mostly grain, and shapes cannot match grain. To set it, watch the score on such a frame and type a number near the score where it looks finished. The number means something else for each Score choice, so check it after you switch. It does nothing when Stop at match is empty. 0: off.","Dark or nearly flat frames stop sooner and can look emptier.","Dark or nearly flat frames get more shapes. Too low, and shapes chase grain."],
+  min_count: ["Fewest shapes","Least shapes a picture gets before Stop at match may end it. It does nothing when Stop at match is empty. With \"build on\", it keeps a still scene from freezing.","Still or nearly flat frames keep changing.","Pictures stop earlier."],
+  mode: ["Mode","The kind of shape used. Combo picks the best kind for each new shape."],
+  "alpha-range": ["Alpha","How see-through each shape is. 255 is solid. 0: the program picks a value for each shape."],
+  background: ["Background","Color of the canvas under the first shape. Empty: the average color of the picture. Restart to apply."],
+  "work-range": ["Working size","Size the picture is shrunk to while the program searches (long side, in pixels). The final picture is drawn again at the output size. Restart to apply.","Finds finer detail, but slower.","Faster, but rougher."],
+  out_preset: ["Output size","Size of the exported picture or video. Shapes are drawn again at this size, so a big output stays sharp. Custom: the picture fits inside the width and height you type and keeps its shape."],
+  repeat: ["Extra shapes per step","After each new shape, tries to add up to this many more by nudging it. It stops early when an extra shape does not help. 0: off.","Many shapes faster, but the extra ones are a bit worse.","Slower, but better shapes."],
+  "video-mode": ["Video frames","Fresh: each frame starts empty, and the shapes jump around. Build on: new shapes go over the previous frame, so the picture changes smoothly."],
+  realtime: ["Build in real time","Each frame gets shapes only for as long as it lasts in the video, so Shapes becomes the most a frame may get. A frame that reaches Shapes or Stop at match early waits for its time. A faster computer builds more shapes per frame. The result is different each time, even with the same seed."],
+  loop_video: ["Loop video","Makes the end of the video join up with the start. Every frame is built a second time, and the first frame starts from the last picture. This takes as long as the first build."],
+  "rules-box": ["Shape rules","Rules that every new shape must follow. They only affect shapes found from now on. Press Restart to see them on the whole picture."],
+  c_angle: ["Direction","Which way shapes lean. One angle: all the same. Steps: only a few angles. Point at a spot: shapes aim at it, like rays. Rings around a spot: shapes run around it. Only affects rotated rectangles, rotated ellipses and curves."],
+  c_angle_step: ["Step","Degrees between the allowed angles, counted from Angle.","Fewer allowed directions, a tidy woven look.","More allowed directions, closer to free."],
+  c_angle_deg: ["Angle","Direction of the long side of every shape. 0 is flat, 90 is upright. In Steps mode, it is the angle that the steps start from."],
+  "mask-invert": ["Invert","Swaps the painted and unpainted areas. It does nothing when nothing is painted."],
+  c_min_size: ["Smallest size","The long side of each shape is at least this (% of the picture's long side). With \"Small shapes here, big elsewhere\" and a painted area, it is the largest size in the painted area instead. 0: off.","Bold poster look, no small details.","Allows fine detail."],
+  c_max_size: ["Largest size","The long side of each shape is at most this (% of the picture's long side). With \"Small shapes here, big elsewhere\" and a painted area, it is the size of the shapes outside the painted area instead. 0: off.","Big, blocky shapes.","Confetti look, needs many more shapes to fill the picture."],
+  c_shrink: ["Shrink as shapes are added","The largest allowed size falls from Largest size to Smallest size by the last shape: big shapes first, fine detail last. If Smallest size is off, it ends at 2%. If Largest size is off, it starts at the full picture. For a video, it starts again on every frame. When Stop at match ends a picture early, the smallest size is not reached."],
+  c_min_ratio: ["At least this long","Each shape is at least this many times longer than wide. Only affects rectangles and ellipses, plain and rotated. 1 or less: off.","Thinner strokes.","Chunkier shapes."],
+  c_max_ratio: ["At most this long","No shape is more than this many times longer than wide. 1: only squares or round ellipses. Only affects rectangles and ellipses, plain and rotated. 0: off.","More stretched shapes allowed.","Closer to square."],
+  c_grid: ["Grid cells","Shapes snap to a grid with this many cells along the picture's long side. Rectangles fill whole cells. Circles, ellipses and rotated rectangles sit in the middle of a cell. The corners of triangles and polygons, and the points of curves, go to grid crossings. 0: off.","Finer mosaic.","Coarser, blockier."],
+  c_area: ["Painted area means","What the area you paint does. Only place shapes here: the middle and the edges of each new shape must be inside the painted area. Small shapes here, big elsewhere: in the painted area, shapes are at most Smallest size. In the rest, they are from half of Largest size up to Largest size. The size changes softly at the edge of the area. A size that is off counts as 3% (small) or 20% (big)."],
+  "mask-paint": ["Paint area","Paint the area that \"Painted area means\" uses. It affects new shapes at once. Press Restart to see it on the whole picture. Nothing painted: no limit. The area is not saved with the settings. It is cleared when the page reloads or when a picture of another shape is loaded."],
+  seq_fps: ["Frame rate","Pictures shown each second.","Faster playback, shorter video.","Slower playback, longer video."],
+  chains: ["Chains","Searches that run side by side for each new shape. The best one wins.","Better shapes, but slower.","Faster, but rougher shapes."],
+  random: ["Random tries per chain","Random shapes each chain looks at before it starts to improve the best one.","Better starting point, but slower.","Faster."],
+  age: ["Age","Failed changes in a row before a chain gives up. It counts single changes, not rounds: with 64 mutations per round, an age of 100 ends a chain after 2 rounds without gain.","More polished shapes, but slower.","Faster, but rougher shapes."],
+  k: ["Mutations per round","Small changes each chain tries at once in each round. The best one is kept if it helps. Age counts these changes, so with a higher value a chain gives up after fewer rounds.","Picks from more changes each round. The graphics card checks them together, so it costs little extra time.","Fewer changes per round, so a chain takes smaller steps."],
+  metric: ["Score","How the gap to the original is measured. Squared gaps: big mistakes count most, so it chases bright spots and fine detail. Plain gaps: all mistakes count the same, so it looks bolder and cleaner. The two give different score and match numbers, so check Stop at match and Lowest score again after you switch. Restart to apply."],
+  seed: ["Seed","Starting number for the random choices. The same seed and settings give the same result, except with Build in real time. With Manual seed off, each Restart picks a new seed. Restart to apply."],
+  export_fmt: ["File type","What Render makes. PNG keeps every pixel exact. JPG is smaller. SVG keeps the shapes as shapes, so it stays sharp at any size. For a single picture, MP4, WebM and GIF make a video of the shapes being added one by one. For a video, the sequence types save one file per frame."],
+  name_pattern: ["File name","Name of the saved file. Tags in curly brackets are replaced: {name} the source file, {shapes} the shape count, {mode} the shape kind, {date} and {time} when it was saved, {frame} the frame number (left out for a single picture). Nothing is overwritten; -2, -3 is added instead."],
+  frame_digits: ["Frame digits","Digits in the frame number. 4 gives 0001, 0002. 0: no zeros."],
+  frame_start: ["First frame","Number of the first frame in the file names. Some programs expect 0, others 1."],
 };
 
 (function setupTips() {
@@ -716,13 +823,13 @@ const TIPS = {
   // `dismissed`: the setting the user clicked or typed in; its box stays
   // closed until the mouse leaves it.
   let timer = null, current = null, dismissed = null;
-  for (const [id, [title, what, tip, example]] of Object.entries(TIPS)) {
+  for (const [id, [title, what, higher, lower]] of Object.entries(TIPS)) {
     const el = $(id);
     if (!el) continue;
     const host = el.tagName === "DETAILS" ? el.querySelector("summary") : (el.closest("label") || el);
     host.dataset.tip = id;
-    host._tip = `<b>${title}</b><p>${what}</p><p><span class="tip-label">Tip:</span> ${tip}</p>` +
-                `<p><span class="tip-label">Example:</span> ${example}</p>`;
+    host._tip = `<b>${title}</b><p>${what}</p>` +
+      (higher ? `<p><span class="tip-label">Higher:</span> ${higher}</p><p><span class="tip-label">Lower:</span> ${lower}</p>` : "");
   }
   function hide() {
     clearTimeout(timer);
@@ -758,3 +865,163 @@ const TIPS = {
   $("panel-body").addEventListener("scroll", hide);
   window.addEventListener("blur", hide);
 })();
+
+// ---------------------------------------------------------- shape rules
+
+// Show only the Direction rows that the chosen direction uses.
+function showRuleRows() {
+  const a = $("c_angle").value;
+  $("c-angle-row").hidden = !(a === "fixed" || a === "steps");
+  $("c-step-row").hidden = a !== "steps";
+  $("c-spot-row").hidden = !(a === "toward" || a === "around");
+  $("mask-hint").textContent = $("c_area").value === "detail"
+    ? "Paint where the small shapes go. Nothing painted = normal sizes everywhere."
+    : "Paint where shapes may go. Nothing painted = no limit.";
+  drawOverlay();
+}
+
+// The layer over the picture. It shows the painted area while painting and
+// the spot that the shapes point at.
+const overlay = $("overlay"), maskCv = $("mask-canvas");
+const MASK_LONG = 128;
+let maskData = null;   // small canvas; painted (opaque) = shapes allowed
+let maskOn = false, maskDrawing = false, maskLast = null, spotPicking = false;
+
+function placeOverlay() {
+  const pic = $("picture");
+  const show = !pic.hidden && pic.naturalWidth > 0;
+  overlay.style.display = show ? "block" : "none";
+  if (!show) return;
+  const v = view.getBoundingClientRect(), r = pic.getBoundingClientRect();
+  overlay.style.left = (r.left - v.left) + "px";
+  overlay.style.top = (r.top - v.top) + "px";
+  overlay.style.width = r.width + "px";
+  overlay.style.height = r.height + "px";
+  // A picture of another shape: the painted area no longer fits it.
+  if (maskData && Math.abs(maskData.width / maskData.height - pic.naturalWidth / pic.naturalHeight) > 0.03) {
+    maskData = null;
+    sendMask();
+  }
+  const cw = Math.max(1, Math.round(r.width)), ch = Math.max(1, Math.round(r.height));
+  if (maskCv.width !== cw || maskCv.height !== ch) { maskCv.width = cw; maskCv.height = ch; }
+  drawOverlay();
+}
+
+function drawOverlay() {
+  const c = maskCv.getContext("2d");
+  c.clearRect(0, 0, maskCv.width, maskCv.height);
+  if (maskOn) {
+    c.fillStyle = "rgba(0, 0, 0, 0.65)";
+    c.fillRect(0, 0, maskCv.width, maskCv.height);
+    if (maskData) {
+      // Inverted: the dark part is the painted part.
+      c.globalCompositeOperation = $("mask-invert").checked ? "destination-in" : "destination-out";
+      c.drawImage(maskData, 0, 0, maskCv.width, maskCv.height);
+      c.globalCompositeOperation = "source-over";
+    }
+  }
+  const a = $("c_angle").value;
+  const spot = (a === "toward" || a === "around") && $("rules-box").open;
+  const dot = $("spot-dot");
+  dot.style.display = spot ? "block" : "none";
+  if (spot) {
+    dot.style.left = (parseFloat($("c_x").value) || 0) + "%";
+    dot.style.top = (parseFloat($("c_y").value) || 0) + "%";
+  }
+  overlay.classList.toggle("active", maskOn || spotPicking);
+  $("mask-clear").disabled = !maskData;
+}
+
+function sendMask() {
+  let bits = "", any = false, w = 0, h = 0;
+  if (maskData) {
+    w = maskData.width; h = maskData.height;
+    const d = maskData.getContext("2d").getImageData(0, 0, w, h).data;
+    const parts = [];
+    const inv = $("mask-invert").checked;
+    for (let i = 3; i < d.length; i += 4) { const on = d[i] >= 128; any = any || on; parts.push(on !== inv ? "1" : "0"); }
+    bits = parts.join("");
+  }
+  if (!any) { maskData = null; send({ t: "mask", w: 0, h: 0, bits: "" }); }
+  else send({ t: "mask", w, h, bits });
+}
+
+function overlayPos(e) {
+  const r = overlay.getBoundingClientRect();
+  return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height];
+}
+
+function paintAt(e) {
+  const pic = $("picture");
+  if (!maskData) {
+    const a = pic.naturalWidth / pic.naturalHeight;
+    maskData = document.createElement("canvas");
+    maskData.width = a >= 1 ? MASK_LONG : Math.max(1, Math.round(MASK_LONG * a));
+    maskData.height = a >= 1 ? Math.max(1, Math.round(MASK_LONG / a)) : MASK_LONG;
+  }
+  const [x, y] = overlayPos(e);
+  const px = x * maskData.width, py = y * maskData.height;
+  const size = parseInt($("mask-brush").value, 10) / 100 * MASK_LONG;
+  const c = maskData.getContext("2d");
+  c.globalCompositeOperation = $("mask-erase").checked ? "destination-out" : "source-over";
+  c.fillStyle = c.strokeStyle = "#fff";
+  c.lineWidth = size;
+  c.lineCap = "round";
+  c.beginPath();
+  c.arc(px, py, size / 2, 0, Math.PI * 2);
+  c.fill();
+  if (maskLast) {
+    c.beginPath();
+    c.moveTo(maskLast[0], maskLast[1]);
+    c.lineTo(px, py);
+    c.stroke();
+  }
+  maskLast = [px, py];
+  drawOverlay();
+}
+
+overlay.addEventListener("pointerdown", (e) => {
+  if (spotPicking) {
+    const [x, y] = overlayPos(e);
+    $("c_x").value = Math.round(x * 1000) / 10;
+    $("c_y").value = Math.round(y * 1000) / 10;
+    setSpotPicking(false);
+    lastEdit = 0;
+    sendSettings();
+    return;
+  }
+  if (!maskOn) return;
+  e.preventDefault();
+  overlay.setPointerCapture(e.pointerId);
+  maskDrawing = true;
+  maskLast = null;
+  paintAt(e);
+});
+overlay.addEventListener("pointermove", (e) => { if (maskDrawing) paintAt(e); });
+for (const ev of ["pointerup", "pointercancel"]) {
+  overlay.addEventListener(ev, () => { if (maskDrawing) { maskDrawing = false; sendMask(); drawOverlay(); } });
+}
+
+function setSpotPicking(on) {
+  spotPicking = on;
+  $("spot-pick").textContent = on ? "Click on the picture…" : "Pick the spot on the picture";
+  $("spot-pick").classList.toggle("primary", on);
+  if (on) setMaskOn(false);
+  drawOverlay();
+}
+function setMaskOn(on) {
+  maskOn = on;
+  $("mask-paint").textContent = on ? "Done painting" : "Paint area";
+  $("mask-paint").classList.toggle("primary", on);
+  $("mask-tools").hidden = !on;
+  if (on && spotPicking) setSpotPicking(false);
+  drawOverlay();
+}
+$("spot-pick").onclick = () => setSpotPicking(!spotPicking);
+$("mask-paint").onclick = () => setMaskOn(!maskOn);
+$("mask-invert").onchange = () => { sendMask(); drawOverlay(); };
+$("mask-clear").onclick = () => { maskData = null; sendMask(); drawOverlay(); };
+$("rules-box").addEventListener("toggle", drawOverlay);
+$("picture").addEventListener("load", placeOverlay);
+for (const k of ["c_x", "c_y"]) $(k).addEventListener("input", drawOverlay);
+showRuleRows();

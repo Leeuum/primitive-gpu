@@ -12,12 +12,15 @@
     <div id="error" hidden><span id="error-text"></span><button id="error-close" title="Close">&times;</button></div>
     <div id="view">
       <img id="picture" alt="">
+      <img id="slot-view" alt="" hidden>
       <img id="original" alt="" hidden>
+      <div id="overlay"><canvas id="mask-canvas"></canvas><div id="spot-dot"></div></div>
       <div id="drop-hint">
         <div class="big">Drop an image, a video, or a folder of pictures here</div>
         <div>or <button id="pick">choose files</button> <button id="pick-folder">choose a folder</button></div>
         <div class="small">Pick several pictures to load them as an image sequence.</div>
       </div>
+      <div id="slots" hidden></div>
       <div id="busy" hidden><div id="busy-text"></div><div class="bar"><div id="busy-bar"></div></div></div>
     </div>
     <div id="controls">
@@ -25,6 +28,8 @@
       <button id="pause-build" hidden title="Stop or go on with building new frames. Playback of the finished frames still works.">Pause building</button>
       <span id="info"></span>
       <span class="grow"></span>
+      <button id="save-frame" hidden title="Save the frame on screen as one picture, at the output size. It is a JPG or SVG when File type is that kind of image sequence, and a PNG otherwise.">Save frame</button>
+      <button id="snapshot" disabled title="Keep the picture on screen, its settings and the painted area in a slot at the top left. Press 1 to 8 to view a slot.">Snapshot</button>
       <button id="hold-original" disabled title="Hold to see the original picture">Original</button>
       <button id="open" title="Load another file">Open…</button>
     </div>
@@ -68,12 +73,58 @@
       <label>Extra shapes per step <input type="number" id="repeat" min="0" max="100"></label>
     </details>
 
+    <details class="sec" id="rules-box">
+      <summary>Shape rules</summary>
+      <label>Direction <span class="hint">rotated shapes and curves</span>
+        <select id="c_angle">
+          <option value="free">Any</option>
+          <option value="fixed">One angle</option>
+          <option value="steps">Steps</option>
+          <option value="toward">Point at a spot</option>
+          <option value="around">Rings around a spot</option>
+        </select>
+      </label>
+      <label id="c-angle-row">Angle <span class="hint">0 = flat, 90 = upright</span>
+        <span class="pair"><input type="range" id="c_angle_deg-range" min="0" max="180"><input type="number" id="c_angle_deg" min="-360" max="360"></span>
+      </label>
+      <label id="c-step-row">Step <span class="hint">degrees between angles</span> <input type="number" id="c_angle_step" min="1" max="180"></label>
+      <div id="c-spot-row">
+        <label>Spot across % <input type="number" id="c_x" min="-100" max="200" step="1"></label>
+        <label>Spot down % <input type="number" id="c_y" min="-100" max="200" step="1"></label>
+        <button id="spot-pick">Pick the spot on the picture</button>
+      </div>
+      <label>Smallest size <span class="hint">% of the picture, 0 = off</span> <input type="number" id="c_min_size" min="0" max="100" step="1"></label>
+      <label>Largest size <span class="hint">% of the picture, 0 = off</span> <input type="number" id="c_max_size" min="0" max="100" step="1"></label>
+      <label class="radio"><input type="checkbox" id="c_shrink"> shrink as shapes are added</label>
+      <label>At least this long <span class="hint">times the width, 0 = off</span> <input type="number" id="c_min_ratio" min="0" max="100" step="0.5"></label>
+      <label>At most this long <span class="hint">1 = square, 0 = off</span> <input type="number" id="c_max_ratio" min="0" max="100" step="0.5"></label>
+      <label>Grid cells <span class="hint">along the long side, 0 = off</span> <input type="number" id="c_grid" min="0" max="256" step="1"></label>
+      <label>Painted area means
+        <select id="c_area">
+          <option value="only">Only place shapes here</option>
+          <option value="detail">Small shapes here, big elsewhere</option>
+        </select>
+      </label>
+      <label class="radio"><input type="checkbox" id="mask-invert"> invert the painted area</label>
+      <div id="mask-row">
+        <span class="pair"><button id="mask-paint">Paint area</button><button id="mask-clear" disabled>Clear area</button></span>
+        <div id="mask-tools" hidden>
+          <label>Brush size <input type="range" id="mask-brush" min="2" max="40" value="12"></label>
+          <label class="radio"><input type="checkbox" id="mask-erase"> erase</label>
+          <div class="hint" id="mask-hint">Paint where shapes may go. Nothing painted = no limit.</div>
+        </div>
+      </div>
+    </details>
+
     <details class="sec">
       <summary>When to stop</summary>
-      <label>Stop at score <span class="hint">empty = off</span>
-        <input type="number" id="target_score" min="0" max="1" step="0.005" placeholder="off">
+      <label>Stop at match <span class="hint">%, empty = off</span>
+        <input type="number" id="stop_match" min="1" max="99" step="1" placeholder="off">
       </label>
-      <label>Fewest shapes <span class="hint">used with Stop at score</span>
+      <label>Lowest score <span class="hint">used with Stop at match</span>
+        <input type="number" id="stop_floor" min="0" max="1" step="0.001">
+      </label>
+      <label>Fewest shapes <span class="hint">used with Stop at match</span>
         <input type="number" id="min_count" min="0" max="100000" step="10">
       </label>
     </details>

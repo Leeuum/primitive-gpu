@@ -608,7 +608,7 @@ impl Shape {
     }
 }
 
-fn triangle_valid(x1: i32, y1: i32, x2: i32, y2: i32, x3: i32, y3: i32) -> bool {
+pub(crate) fn triangle_valid(x1: i32, y1: i32, x2: i32, y2: i32, x3: i32, y3: i32) -> bool {
     const MIN_DEGREES: f64 = 15.0;
     let angle = |ax: i32, ay: i32, bx: i32, by: i32, cx: i32, cy: i32| {
         let (mut ux, mut uy) = ((bx - ax) as f64, (by - ay) as f64);
@@ -627,7 +627,7 @@ fn triangle_valid(x1: i32, y1: i32, x2: i32, y2: i32, x3: i32, y3: i32) -> bool 
     a1 > MIN_DEGREES && a2 > MIN_DEGREES && a3 > MIN_DEGREES
 }
 
-fn quadratic_valid(x1: f64, y1: f64, x2: f64, y2: f64, x3: f64, y3: f64) -> bool {
+pub(crate) fn quadratic_valid(x1: f64, y1: f64, x2: f64, y2: f64, x3: f64, y3: f64) -> bool {
     let dx12 = (x1 - x2) as i64;
     let dy12 = (y1 - y2) as i64;
     let dx23 = (x2 - x3) as i64;
@@ -738,7 +738,7 @@ fn sin_cos_deg(angle: i32) -> (f64, f64) {
 /// The 4 corners of a rotated rectangle in whole image coordinates. Shared
 /// by rasterize_rotated_rect and gpu_record so that they always agree.
 #[inline]
-fn rotated_rect_corners(x: i32, y: i32, sx: i32, sy: i32, angle: i32) -> [(i32, i32); 4] {
+pub(crate) fn rotated_rect_corners(x: i32, y: i32, sx: i32, sy: i32, angle: i32) -> [(i32, i32); 4] {
     let (hx, hy) = (sx as f64 / 2.0, sy as f64 / 2.0);
     let (s, c) = sin_cos_deg(angle);
     let corner = |px: f64, py: f64| ((px * c - py * s) as i32 + x, (px * s + py * c) as i32 + y);

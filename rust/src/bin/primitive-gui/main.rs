@@ -472,6 +472,14 @@ fn parse_command(text: &str) -> Option<Cmd> {
         "pause_build" => Cmd::PauseBuild(true),
         "resume_build" => Cmd::PauseBuild(false),
         "restart" => Cmd::Restart,
+        "mask" => {
+            let (w, h) = (v["w"].as_u64()? as usize, v["h"].as_u64()? as usize);
+            let bits = v["bits"].as_str()?;
+            if w > 1024 || h > 1024 || bits.len() != w * h {
+                return None;
+            }
+            Cmd::Mask { w, h, gray: bits.bytes().map(|b| if b == b'1' { 255 } else { 0 }).collect() }
+        }
         "seek" => Cmd::Seek(v["frame"].as_u64()? as usize),
         "render" => Cmd::Render,
         "cancel" => Cmd::Cancel,

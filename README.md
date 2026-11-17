@@ -81,10 +81,29 @@ GPU search tuning:
 | `chains` | 16 | hill-climbing chains per shape |
 | `random` | 1000 | random tries that seed each chain |
 | `age` | 100 | tries without improvement before a chain stops |
-| `k` | 32 | nudges each chain tries per GPU round |
+| `k` | 64 | nudges each chain tries per GPU round |
 | `seed` | clock | random seed; repeatable with the same `-j` |
 | `raster` | gpu | who draws the candidate shapes: `gpu` or `cpu` (the older path) |
 | `check` | off | also score every candidate exactly on the CPU and report the GPU's error (slow) |
+
+Creative rules for the shapes (all off by default):
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `angle` | off | every shape leans this way, in degrees: 0 = flat, 90 = upright (angle rules work with modes 5, 6 and 7) |
+| `angle-step` | off | only angles this many degrees apart, e.g. 45; counted from `-angle` |
+| `toward` | off | shapes point at a spot: `x,y` in percent of the width and height, e.g. `50,30` |
+| `around` | off | shapes run in rings around a spot (`x,y` in percent) |
+| `min-size` | off | smallest shape, in percent of the picture's long side |
+| `max-size` | off | largest shape, in percent of the picture's long side |
+| `shrink` | off | the largest size falls from `-max-size` to `-min-size` during the run (big shapes first, details last) |
+| `min-ratio` | off | shapes are at least this many times as long as wide (thin strokes); modes 2, 3, 5 and 7 only |
+| `max-ratio` | off | shapes are at most this many times as long as wide (1 = square); modes 2, 3, 5 and 7 only |
+| `grid` | off | snap shapes to a grid of this many cells along the long side |
+| `mask` | off | picture of the area where shapes may be: white = allowed |
+| `detail` | off | picture of the detail area: white = small shapes (up to `-min-size`), black = big shapes (half of `-max-size` up to it) |
+
+For example, `-m 5 -toward 75,20` makes every rectangle point at a spot in the upper right, and `-m 2 -grid 16` gives a mosaic of tiles.
 
 GIF output animates the shapes being added. With `%d` in a PNG, JPG or SVG name, every frame is saved as its own file.
 
@@ -99,7 +118,8 @@ target/release/primitive-gui -port 9000 -j 8 -no-open
 The page works from any device on the same network.
 
 - **Input:** an image, a video, or a folder of pictures (an image sequence).
-- **Stopping:** "Shapes" sets the most shapes per picture, "Stop at score" stops once it is close enough, and "Fewest shapes" keeps dark frames from stopping too soon.
+- **Stopping:** "Shapes" sets the most shapes per picture, "Stop at match" stops a picture once that much of it is matched (in percent, so dark and bright frames end up equally finished), "Lowest score" lets dark or nearly flat frames stop early, and "Fewest shapes" sets the least shapes a picture gets before that.
+- **Shape rules:** the same creative rules as the command line (direction, size, proportions, grid), plus an area that you paint on the picture. The painted area either keeps the shapes inside it, or marks where the small shapes go while the rest gets big shapes.
 - **Export:** PNG, JPG, SVG or a timelapse, at any size up to 4K without a new search.
 - **Videos:** every loop adds more shapes to each frame. Each frame can start fresh or build on the one before.
 - **Loop video:** in "build on" mode, makes a video that joins up when it plays in a loop. Every frame is built a second time, starting on the last frame's picture, so the end turns into the start like any other two frames.

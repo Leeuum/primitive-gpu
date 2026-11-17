@@ -18,7 +18,7 @@ printf "metric\traster\tmode\tcandidates\tdiffer\tmax_diff\twinner_differs\tscor
 for e in $METRICS; do
 for r in $RASTERS; do
   for m in $MODES; do
-    out=$("$BIN" -i "../examples/$PIC.png" -o /tmp/check_out.png -n "$N" -m "$m" -seed 1 -j 8 -v -check -raster "$r" -metric "$e")
+    out=$("$BIN" -i "../examples/$PIC.png" -o /tmp/check_out.png -n "$N" -m "$m" -seed 1 -j 8 -k 32 -v -check -raster "$r" -metric "$e")
     cand=$(sed -n 's/^check: \([0-9]*\) candidates.*/\1/p' <<<"$out")
     differ=$(sed -n 's/^  score differs from exact: \([0-9]*\) candidates.*/\1/p' <<<"$out")
     maxd=$(sed -n 's/.*max |diff| \([0-9]*\),.*/\1/p' <<<"$out")
