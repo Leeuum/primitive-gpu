@@ -108,14 +108,15 @@ jobs:
       - name: Add ffmpeg (Mac)
         if: runner.os == 'macOS'
         run: |
-          # The site answers HEAD requests with 404, so ask for the first byte to learn where the redirect goes.
-          # The site is sometimes slow to answer GitHub's Mac machines, so every download tries again.
+          # The original site often times out for GitHub's Mac machines, so the build uses an unchanged copy kept in this repo's ffmpeg-mac-9.0.2 release.
           get() { curl -sfL --connect-timeout 30 --retry 6 --retry-delay 10 --retry-all-errors "$@"; }
-          url=$(get -r 0-0 -o /dev/null -w '%{url_effective}' https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip)
-          echo "Using $url"
+          url=https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2/ffmpeg.zip
+          copy=https://github.com/Leeuum/primitive-gpu/releases/download/ffmpeg-mac-9.0.2
           mkdir ff && cd ff
-          get -o ffmpeg.zip "$url"
-          get -o ffprobe.zip "${url%ffmpeg.zip}ffprobe.zip"
+          get -o ffmpeg.zip "$copy/ffmpeg.zip"
+          get -o ffprobe.zip "$copy/ffprobe.zip"
+          echo "c8ed4c4e6978a03c485edbfe4e0a5dc2380f8a30bba5150531b31b094492d924  ffmpeg.zip" | shasum -a 256 -c
+          echo "fcbe839537485eaee7a7a8bc5cbc0f90d53617e80943e8a5b2e31cb851197ea6  ffprobe.zip" | shasum -a 256 -c
           unzip -q ffmpeg.zip && unzip -q ffprobe.zip
           chmod +x ffmpeg ffprobe
           cp ffmpeg ffprobe "../$DIR"/
