@@ -1,0 +1,66 @@
+PRIMITIVE PICTURES, ON THE GPU
+==============================
+
+Rebuild any picture or video from simple shapes.
+Project page: https://github.com/Leeuum/primitive-gpu
+
+
+HOW TO START IT
+---------------
+
+Double-click "primitive-gui". A small text window opens, and then the
+program opens in your web browser. If the browser does not open, go to
+http://localhost:8640 yourself.
+
+To stop it, close the small text window. It also stops by itself
+10 minutes after you close the last browser tab, unless it is still
+rendering or building.
+
+Your renders are saved in the "primitive" folder inside your Videos
+folder (Movies on a Mac).
+
+
+THE FIRST TIME ONLY
+-------------------
+
+The program is not signed with a paid certificate, so your computer
+warns you about it once.
+
+Windows: if a blue "Windows protected your PC" box appears, click
+"More info", then "Run anyway". If Windows asks about network access,
+you can say no; the program still works on this computer. Say yes only
+if you want to use it from your phone or another computer at home.
+
+Mac (Apple Silicon only): double-click "primitive-gui". When the Mac
+says it cannot check the program, click "Done". Open System Settings,
+go to "Privacy & Security", scroll down, and click "Open Anyway" next
+to "primitive-gui". Double-click it again and click "Open Anyway".
+
+Linux: double-click "primitive-gui" and choose "Run in Terminal". Or
+open a terminal in this folder and type:  ./primitive-gui
+
+
+WHAT YOU NEED
+-------------
+
+A graphics card that supports Vulkan, Metal or DirectX 12. Almost every
+computer from the last ten years has one.
+
+
+WHAT IS IN THIS FOLDER
+----------------------
+
+primitive-gui     The program. Start this one.
+ffmpeg, ffprobe   Used to read and write videos. These are separate
+                  programs from the FFmpeg project, under the GPL
+                  licence (see FFMPEG-LICENSE.txt). On Windows, the
+                  .dll files and, on Linux, the "lib" folder belong
+                  to them. Keep them next to ffmpeg.
+                  The small "no-ffmpeg" download leaves them out.
+                  Pictures still work. For videos, GIFs and HEIC
+                  photos, install ffmpeg on your computer, or get
+                  the full download.
+LICENSE.txt       The licence of primitive-gpu (MIT).
+THIRD-PARTY-LICENSES.txt
+                  The licences of the code libraries built
+                  into the programs.

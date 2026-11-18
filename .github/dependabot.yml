@@ -1,0 +1,19 @@
+# Opens a pull request once a month when a Rust library or a GitHub
+# action has a newer version. Security fixes come sooner, as separate
+# pull requests, through Dependabot security updates in the repo settings.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /rust
+    schedule:
+      interval: monthly
+    groups:
+      rust-libraries:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]

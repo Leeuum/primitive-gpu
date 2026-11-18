@@ -1,0 +1,178 @@
+# Builds the download for Windows, Mac and Linux when a version tag
+# (for example v0.1.0) is pushed, and puts the files in a draft
+# release. Nothing is public until the draft is published by hand.
+# "Run workflow" on the Actions page builds the files without a release.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: github.repository == 'Leeuum/primitive-gpu'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, name: windows-x64, exe: .exe }
+          - { os: macos-latest, name: mac-arm64, exe: "" }
+          # The oldest supported Ubuntu, so the program runs on older Linux too.
+          - { os: ubuntu-22.04, name: linux-x64, exe: "" }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Build
+        run: cd rust && cargo build --release --locked
+
+      - name: Make the folder
+        run: |
+          ver="${GITHUB_REF_NAME}"
+          [[ "$ver" == v* ]] || ver="test"
+          dir="primitive-gpu-$ver-${{ matrix.name }}"
+          mkdir "$dir"
+          cp rust/target/release/primitive-gui${{ matrix.exe }} "$dir"/
+          cp LICENSE "$dir/LICENSE.txt"
+          cp packaging/START-HERE.txt "$dir"/
+          echo "DIR=$dir" >> "$GITHUB_ENV"
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+
+      # The MIT and Apache licences of the libraries ask for their text to ship with the program.
+      - name: Add the licences of the Rust libraries
+        run: cd rust && cargo about generate --locked about.hbs > "../$DIR/THIRD-PARTY-LICENSES.txt"
+
+      # The small download: the same folder without ffmpeg, for people who
+      # have ffmpeg installed or only use pictures.
+      - name: Make the small folder
+        run: cp -r "$DIR" "$DIR-no-ffmpeg"
+
+      # Ready-made ffmpeg builds that include the H.264 and VP9 encoders.
+      # The "shared" builds keep the code in libraries that ffmpeg and
+      # ffprobe both use, so the download carries it once instead of twice.
+      - name: Add ffmpeg (Windows, Linux)
+        if: runner.os != 'macOS'
+        run: |
+          kind=${{ runner.os == 'Windows' && 'win64' || 'linux64' }}
+          ext=${{ runner.os == 'Windows' && 'zip' || 'tar.xz' }}
+          asset=$(gh api repos/BtbN/FFmpeg-Builds/releases/latest --jq '.assets[].name' \
+            | grep -E "^ffmpeg-n[0-9.]+-latest-$kind-gpl-shared-[0-9.]+\.$ext$" | sort -V | tail -1)
+          echo "Using $asset"
+          gh release download latest -R BtbN/FFmpeg-Builds -p "$asset" -D ff
+          cd ff
+          if [ "$ext" = zip ]; then 7z x "$asset" > /dev/null; else tar -xf "$asset"; fi
+          top=$(find . -mindepth 1 -maxdepth 1 -type d | head -1)
+          cp "$top"/bin/ffmpeg${{ matrix.exe }} "$top"/bin/ffprobe${{ matrix.exe }} "../$DIR"/
+          if [ "${{ runner.os }}" = Windows ]; then
+            # Windows finds the DLLs next to the program.
+            cp "$top"/bin/*.dll "../$DIR"/
+          else
+            # The libraries go in lib/. Copy each under the name ffmpeg asks
+            # for (libavcodec.so.63 and so on), as a file, not a link.
+            mkdir "../$DIR/lib"
+            for f in "$top"/lib/*.so.*; do
+              if [[ "$f" =~ \.so\.[0-9]+$ ]]; then cp -L "$f" "../$DIR/lib"/; fi
+            done
+            # The build looks for its libraries in ../lib; point it at lib/ next to it.
+            sudo apt-get install -y -qq patchelf
+            for b in ffmpeg ffprobe; do patchelf --force-rpath --set-rpath '$ORIGIN/lib' "../$DIR/$b"; done
+          fi
+          cp "$top"/LICENSE.txt "../$DIR/FFMPEG-LICENSE.txt"
+          # The GPL asks for the source of this exact build: the FFmpeg commit it was made from, and the build scripts.
+          version=$("../$DIR"/ffmpeg${{ matrix.exe }} -version | head -1)
+          commit=$(grep -oE -- '-g[0-9a-f]{7,}' <<<"$version" | head -1 | cut -c3-)
+          {
+            echo ""
+            echo "FFmpeg build from https://github.com/BtbN/FFmpeg-Builds ($asset)."
+            echo "Version: $version"
+            if [ -n "$commit" ]; then echo "FFmpeg source code: https://github.com/FFmpeg/FFmpeg/commit/$commit"; fi
+            echo "Build scripts and the versions of the libraries inside: https://github.com/BtbN/FFmpeg-Builds"
+          } >> "../$DIR/FFMPEG-LICENSE.txt"
+
+      - name: Add ffmpeg (Mac)
+        if: runner.os == 'macOS'
+        run: |
+          # The site answers HEAD requests with 404, so ask for the first byte to learn where the redirect goes.
+          # The site is sometimes slow to answer GitHub's Mac machines, so every download tries again.
+          get() { curl -sfL --connect-timeout 30 --retry 6 --retry-delay 10 --retry-all-errors "$@"; }
+          url=$(get -r 0-0 -o /dev/null -w '%{url_effective}' https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip)
+          echo "Using $url"
+          mkdir ff && cd ff
+          get -o ffmpeg.zip "$url"
+          get -o ffprobe.zip "${url%ffmpeg.zip}ffprobe.zip"
+          unzip -q ffmpeg.zip && unzip -q ffprobe.zip
+          chmod +x ffmpeg ffprobe
+          cp ffmpeg ffprobe "../$DIR"/
+          curl -sfL -o "../$DIR/FFMPEG-LICENSE.txt" https://www.gnu.org/licenses/gpl-3.0.txt
+          echo "" >> "../$DIR/FFMPEG-LICENSE.txt"
+          # The GPL asks for the source of this exact build: the FFmpeg release it was made from, and the build scripts.
+          version=$(./ffmpeg -version | head -1)
+          release=$(awk '{print $3}' <<<"$version")
+          {
+            echo "FFmpeg build from https://ffmpeg.martin-riedl.de ($url)."
+            echo "Version: $version"
+            if [[ "$release" =~ ^[0-9.]+$ ]]; then echo "FFmpeg source code: https://ffmpeg.org/releases/ffmpeg-$release.tar.xz"; fi
+            echo "Build scripts and the versions of the libraries inside: https://git.martin-riedl.de/ffmpeg/build-script"
+          } >> "../$DIR/FFMPEG-LICENSE.txt"
+
+      - name: Check the bundled ffmpeg can make the videos the GUI makes
+        run: |
+          "$DIR"/ffprobe${{ matrix.exe }} -hide_banner -version > /dev/null || { echo "ffprobe does not start"; exit 1; }
+          for c in libx264 libvpx-vp9 libopus aac; do
+            "$DIR"/ffmpeg${{ matrix.exe }} -hide_banner -encoders | grep -q " $c " || { echo "missing encoder $c"; exit 1; }
+          done
+
+      - name: Pack
+        run: |
+          for d in "$DIR" "$DIR-no-ffmpeg"; do
+            if [ "${{ runner.os }}" = Linux ]; then
+              tar -czf "$d.tar.gz" "$d"
+            elif [ "${{ runner.os }}" = Windows ]; then
+              7z a -tzip "$d.zip" "$d" > /dev/null
+            else
+              zip -qry "$d.zip" "$d"
+            fi
+          done
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ env.DIR }}.zip
+            ${{ env.DIR }}.tar.gz
+            ${{ env.DIR }}-no-ffmpeg.zip
+            ${{ env.DIR }}-no-ffmpeg.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: files
+          merge-multiple: true
+      - name: Make a draft release
+        run: |
+          gh release create "$GITHUB_REF_NAME" files/* -R "$GITHUB_REPOSITORY" --draft \
+            --title "primitive-gpu $GITHUB_REF_NAME" \
+            --notes "Download the file for your computer, unzip it, and double-click primitive-gui. Read START-HERE.txt inside for the one-time security step on Windows and Mac. The files ending in no-ffmpeg are much smaller and leave out ffmpeg. They work for pictures. For videos, GIFs and HEIC photos, they need ffmpeg installed on your computer. If you are not sure, take the full download."
