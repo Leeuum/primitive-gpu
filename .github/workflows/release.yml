@@ -120,7 +120,7 @@ jobs:
           unzip -q ffmpeg.zip && unzip -q ffprobe.zip
           chmod +x ffmpeg ffprobe
           cp ffmpeg ffprobe "../$DIR"/
-          curl -sfL -o "../$DIR/FFMPEG-LICENSE.txt" https://www.gnu.org/licenses/gpl-3.0.txt
+          get -o "../$DIR/FFMPEG-LICENSE.txt" "$copy/gpl-3.0.txt"
           echo "" >> "../$DIR/FFMPEG-LICENSE.txt"
           # The GPL asks for the source of this exact build: the FFmpeg release it was made from, and the build scripts.
           version=$(./ffmpeg -version | head -1)
