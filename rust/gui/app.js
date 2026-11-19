@@ -39,13 +39,13 @@ $("ask-reset").onclick = () => { for (const k of skipped()) localStorage.removeI
 showAskReset();
 let ws = null;
 let st = null;               // newest status from the program
-let picUrl = null;
 let picBlob = null;          // the picture on screen, kept for Snapshot
 let myRender = false;        // this page pressed Render
 let downloaded = null;       // render file this page already downloaded
 let lastEdit = 0;            // time of the last settings edit on this page
 let connected = false;
 let localError = null;
+let defaults = null;         // the starting value of each setting
 
 // ------------------------------------------------------------ connection
 
@@ -53,7 +53,13 @@ function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws`);
   ws.binaryType = "blob";
-  ws.onopen = () => { connected = true; localError = null; if (maskData) sendMask(); render(); };
+  ws.onopen = () => {
+    connected = true;
+    localError = null;
+    if (!defaults) fetch("/defaults").then((r) => r.json()).then((d) => { defaults = d; }).catch(() => {});
+    if (maskData) sendMask();
+    render();
+  };
   ws.onclose = () => {
     connected = false;
     localError = "Lost the connection to primitive-gui. Trying again…";
@@ -65,12 +71,34 @@ function connect() {
       st = JSON.parse(ev.data);
       render();
     } else {
-      const url = URL.createObjectURL(ev.data);
-      const blob = ev.data;
-      $("picture").onload = () => { if (picUrl && picUrl !== url) URL.revokeObjectURL(picUrl); picUrl = url; picBlob = blob; };
-      $("picture").src = url;
+      showPicture(ev.data);
     }
   };
+}
+
+// Shows one picture at a time. A new picture that arrives during loading
+// waits, and only the newest one waits. Without this, each new picture
+// stops the one before it and a fast drag shows nothing.
+// The browser unpacks the JPEG in the background. The picture goes on the
+// canvas at the next screen frame, so the page never stops to unpack it, and
+// a picture only counts as done when it is on screen.
+let picLoading = false, picWaiting = null;
+function showPicture(blob) {
+  if (picLoading) { picWaiting = blob; return; }
+  picLoading = true;
+  const done = () => {
+    picLoading = false;
+    if (picWaiting) { const next = picWaiting; picWaiting = null; showPicture(next); }
+  };
+  createImageBitmap(blob).then((bmp) => requestAnimationFrame(() => {
+    const pic = $("picture");
+    const newSize = !picBlob || pic.width !== bmp.width || pic.height !== bmp.height;
+    if (newSize) { pic.width = bmp.width; pic.height = bmp.height; }
+    pic.getContext("bitmaprenderer").transferFromImageBitmap(bmp);
+    picBlob = blob;
+    if (newSize) placeOverlay();
+    done();
+  }), done);
 }
 
 function send(obj) {
@@ -553,6 +581,7 @@ const tl = $("timeline");
 let seeking = false;
 let lastSeek = 0;
 function seekAt(e) {
+  if (st && st.kind === "image" && st.ready && !st.render) { moveHead(shapeAt(e)); return; }
   if (!st || !st.video || st.render) return;
   const r = tl.getBoundingClientRect();
   const n = st.video.frames;
@@ -562,9 +591,204 @@ function seekAt(e) {
   lastSeek = now;
   send({ t: "seek", frame: f });
 }
-tl.addEventListener("pointerdown", (e) => { seeking = true; tl.setPointerCapture(e.pointerId); seekAt(e); });
-tl.addEventListener("pointermove", (e) => { if (seeking) seekAt(e); });
-tl.addEventListener("pointerup", (e) => { seeking = false; seekAt(e); });
+// Still picture: the top lane moves the playhead, the bottom lane holds the
+// keyframe diamonds. The two never overlap.
+const HEAD_LANE = 18;
+function inKeyLane(e) { return st && st.kind === "image" && e.clientY - tl.getBoundingClientRect().top >= HEAD_LANE; }
+function keyNear(e) {
+  const x = e.clientX - tl.getBoundingClientRect().left;
+  let best, bestD = 9;
+  for (const at of keyShapes()) { const d = Math.abs(shapeX(at) - x); if (d < bestD) { best = at; bestD = d; } }
+  return best;
+}
+tl.addEventListener("pointerdown", (e) => {
+  tl.setPointerCapture(e.pointerId);
+  if (inKeyLane(e)) {
+    // Pressing on a diamond picks it up. A drag moves it. The playhead
+    // stays where it is. Empty space here does nothing.
+    const near = keyNear(e);
+    if (near !== undefined) keyDrag = { from: near, to: near, x: e.clientX, moved: false };
+    return;
+  }
+  seeking = true;
+  seekAt(e);
+});
+tl.addEventListener("pointermove", (e) => {
+  if (!keyDrag && !seeking && st && st.kind === "image")
+    tl.style.cursor = inKeyLane(e) ? (keyNear(e) !== undefined ? "grab" : "default") : "ew-resize";
+  if (keyDrag) {
+    keyDrag.moved = keyDrag.moved || Math.abs(e.clientX - keyDrag.x) > 3;
+    if (keyDrag.moved) { keyDrag.to = Math.min(shapeAt(e), st.settings.count - 1); drawTimeline(); }
+  } else if (seeking) seekAt(e);
+});
+tl.addEventListener("pointerup", (e) => {
+  if (keyDrag) {
+    if (keyDrag.moved && keyDrag.to !== keyDrag.from) send({ t: "key_move", from: keyDrag.from, to: keyDrag.to });
+    keyDrag = null;
+  } else if (seeking) seekAt(e);
+  seeking = false;
+});
+
+// ------------------------------------------------------------- keyframes
+// Works like Blender: a dot beside each setting makes a keyframe at the
+// playhead. Yellow field = a key on this shape, green = keys elsewhere,
+// orange = changed here but not keyed yet.
+
+const KEYABLE = ["mode", "alpha", "repeat", "c_angle", "c_angle_deg", "c_angle_step", "c_x", "c_y", "c_min_size", "c_max_size", "c_shrink",
+  "c_min_ratio", "c_max_ratio", "c_grid", "c_area", "chains", "random", "age", "k"];
+const keyDots = {};
+let keyDrag = null;
+let maskRev = null;
+
+// The playhead follows the mouse on this page at once. The picture follows
+// when the program has made it.
+let localHead = null, localHeadTime = 0, headFrame = 0;
+function shownHead() { return localHead === null ? st.keys.head : localHead; }
+function moveHead(at) {
+  localHead = at;
+  localHeadTime = Date.now();
+  if (headFrame) return;
+  headFrame = requestAnimationFrame(() => {
+    headFrame = 0;
+    if (localHead === null) return;
+    send({ t: "shape_view", at: localHead });
+    drawTimeline();
+    $("time").textContent = `${localHead} / ${st.settings.count} shapes`;
+  });
+}
+
+function shapeAt(e) {
+  const r = tl.getBoundingClientRect();
+  return Math.max(0, Math.min(st.settings.count, Math.round((e.clientX - r.left) / r.width * st.settings.count)));
+}
+function shapeX(at) { return at / Math.max(1, st.settings.count) * tl.clientWidth; }
+function keyHead() { return Math.min(shownHead(), Math.max(0, st.settings.count - 1)); }
+function keyShapes() { return [...new Set(Object.values(st.keys.tracks).flat())].sort((a, b) => a - b); }
+function keyState(f) {
+  const t = st && st.keys && st.keys.tracks[f];
+  return !t ? "" : t.includes(keyHead()) ? "on" : "anim";
+}
+function panelValue(f) { return f === "c_shrink" ? $(f).checked : $(f).value; }
+
+function toggleKey(field) {
+  send({ t: keyState(field) === "on" ? "key_del" : "key_set", field, at: keyHead() });
+}
+
+function addKeyDot(field, host, inPair) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "key-dot" + (inPair ? " in-pair" : "");
+  b.title = "Keyframe this setting at the playhead";
+  b.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!st || !st.ready) return;
+    toggleKey(field);
+  });
+  host.append(b);
+  keyDots[field] = b;
+}
+for (const f of KEYABLE) {
+  const row = $(f).closest("label");
+  row.classList.add("keyed-row");
+  addKeyDot(f, row, false);
+  // Changing a value on its own keyframe updates that keyframe.
+  const update = () => { if (keyState(f) === "on") send({ t: "key_set", field: f, at: keyHead() }); };
+  $(f).addEventListener("change", update);
+  const range = $(f + "-range");
+  if (range) range.addEventListener("change", update);
+}
+addKeyDot("mask", $("mask-row").querySelector(".pair"), true);
+
+function drawKeyDots() {
+  document.body.classList.toggle("has-keys", st.kind === "image" && !!st.ready);
+  for (const f of Object.keys(keyDots)) {
+    let state = keyState(f);
+    if (state === "anim" && f !== "mask" && String(Number(panelValue(f)) || panelValue(f)) !== String(Number(st.keys.values[f]) || st.keys.values[f])) state = "changed";
+    keyDots[f].classList.toggle("on", state === "on");
+    keyDots[f].classList.toggle("anim", state === "anim");
+    keyDots[f].classList.toggle("changed", state === "changed");
+    if (f === "mask") continue;
+    $(f).classList.toggle("key-on", state === "on");
+    $(f).classList.toggle("key-anim", state === "anim");
+    $(f).classList.toggle("key-changed", state === "changed");
+  }
+}
+
+// A keyframe changed the painted area: show the new one on this page.
+function syncKeyMask() {
+  const rev = st.keys.mask_rev;
+  if (maskRev === rev) return;
+  const first = maskRev === null;
+  maskRev = rev;
+  if (first) return;
+  fetch("/mask").then((r) => r.json()).then((m) => {
+    maskData = null;
+    if (m.w > 0) {
+      maskData = document.createElement("canvas");
+      maskData.width = m.w; maskData.height = m.h;
+      const g = maskData.getContext("2d");
+      const img = g.createImageData(m.w, m.h);
+      for (let i = 0; i < m.bits.length; i++) img.data[i * 4 + 3] = m.bits[i] === "1" ? 255 : 0;
+      g.putImageData(img, 0, 0);
+    }
+    $("mask-invert").checked = false;
+    drawOverlay();
+  }).catch(() => {});
+}
+
+function drawShapeTimeline() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(tl.clientWidth * dpr)), h = Math.round(46 * dpr);
+  if (tl.width !== w || tl.height !== h) { tl.width = w; tl.height = h; }
+  const g = tl.getContext("2d");
+  const count = Math.max(1, st.settings.count);
+  const xOf = (at) => at / count * w;
+  const lane = Math.round(HEAD_LANE * dpr);
+  // Top lane (playhead) is lighter than the bottom lane (keyframes).
+  g.fillStyle = "#2a2a2a";
+  g.fillRect(0, 0, w, lane);
+  g.fillStyle = "#161616";
+  g.fillRect(0, lane, w, h - lane);
+  g.fillStyle = "#3a3a3a";
+  g.fillRect(0, lane, w, Math.max(1, Math.round(dpr)));
+  g.fillStyle = "#3fa34d";
+  g.fillRect(0, h - Math.round(4 * dpr), xOf(Math.min(st.shapes, count)), Math.round(4 * dpr));
+  const head = shownHead();
+  const y = Math.round((HEAD_LANE + (46 - HEAD_LANE - 4) / 2) * dpr), r = 6 * dpr;
+  for (let at of keyShapes()) {
+    if (keyDrag && keyDrag.from === at) at = keyDrag.to;
+    const x = xOf(at);
+    g.fillStyle = at === head ? "#ffffff" : "#e8b23a";
+    g.beginPath();
+    g.moveTo(x, y - r); g.lineTo(x + r, y); g.lineTo(x, y + r); g.lineTo(x - r, y);
+    g.closePath();
+    g.fill();
+  }
+  // The playhead: a blue flag with the shape number.
+  const px = xOf(head), label = String(head);
+  g.font = `${Math.round(11 * dpr)}px monospace`;
+  const fw = g.measureText(label).width + 8 * dpr, fh = lane;
+  const fx = Math.max(0, Math.min(w - fw, px - fw / 2));
+  g.fillStyle = "#237bd3";
+  g.fillRect(Math.round(px - dpr / 2), 0, Math.max(1, Math.round(dpr)), h);
+  g.fillRect(fx, 0, fw, fh);
+  g.fillStyle = "#ffffff";
+  g.textBaseline = "middle";
+  g.fillText(label, fx + 4 * dpr, fh / 2 + dpr / 2);
+}
+
+// Still picture: left / right move one shape, up jumps to the last shape,
+// down to the first.
+document.addEventListener("keydown", (e) => {
+  if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key)) return;
+  if (!st || st.kind !== "image" || !st.ready || st.render || e.ctrlKey || e.altKey || e.metaKey || $("ask").open) return;
+  if (e.target.closest && e.target.closest("input:not([type=checkbox]), select, textarea")) return;
+  e.preventDefault();
+  const head = shownHead();
+  const at = e.key === "ArrowUp" ? st.settings.count : e.key === "ArrowDown" ? 0 : head + (e.key === "ArrowRight" ? 1 : -1);
+  moveHead(Math.max(0, Math.min(st.settings.count, at)));
+});
 
 // Arrow keys: left / right move one frame, up jumps to the last frame,
 // down to the first. Not while the cursor is in a setting, so the keys
@@ -587,6 +811,7 @@ document.addEventListener("keydown", (e) => {
 });
 
 function drawTimeline() {
+  if (st.kind === "image") return drawShapeTimeline();
   const v = st.video;
   const dpr = window.devicePixelRatio || 1;
   const w = Math.max(1, Math.round(tl.clientWidth * dpr)), h = Math.round(34 * dpr);
@@ -659,8 +884,8 @@ function render() {
 
   view.classList.toggle("empty", !st.ready);
   $("drop-hint").hidden = !!st.ready || !!st.loading;
+  // The overlay follows the picture by itself (see the ResizeObserver).
   $("picture").hidden = !st.ready;
-  placeOverlay();
 
   if (st.loading) {
     $("busy").hidden = false;
@@ -698,7 +923,17 @@ function render() {
   }
   $("info").textContent = info;
 
-  $("timeline-row").hidden = !isVideo;
+  const stillLine = st.kind === "image" && !!st.ready;
+  if (localHead !== null && !seeking && (!stillLine || st.keys.head === localHead || Date.now() - localHeadTime > 1000)) localHead = null;
+  $("timeline-row").hidden = !(isVideo || stillLine);
+  tl.classList.toggle("still", stillLine);
+  if (!stillLine) tl.style.cursor = "";
+  drawKeyDots();
+  syncKeyMask();
+  if (stillLine) {
+    drawTimeline();
+    $("time").textContent = `${shownHead()} / ${s.count} shapes`;
+  }
   if (isVideo) {
     drawTimeline();
     const fps = st.video.fps;
@@ -775,7 +1010,42 @@ function render() {
   }
 }
 
-window.addEventListener("resize", () => { if (st && st.video) drawTimeline(); placeOverlay(); });
+window.addEventListener("resize", () => { if (st && (st.video || (st.kind === "image" && st.ready))) drawTimeline(); placeOverlay(); });
+
+// Drag the panel's left edge to change its width. The page remembers it.
+{
+  const panel = $("panel"), grip = $("panel-grip"), KEY = "panel-width";
+  const setWidth = (px) => {
+    const w = Math.round(Math.max(260, Math.min(window.innerWidth * 0.6, px)));
+    panel.style.width = w + "px";
+    return w;
+  };
+  const saved = Number(localStorage.getItem(KEY));
+  if (saved) setWidth(saved);
+  let drag = null;
+  grip.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    grip.setPointerCapture(e.pointerId);
+    grip.classList.add("drag");
+    drag = { x: e.clientX, w: panel.getBoundingClientRect().width };
+  });
+  grip.addEventListener("pointermove", (e) => {
+    if (!drag) return;
+    setWidth(drag.w + drag.x - e.clientX);
+    window.dispatchEvent(new Event("resize"));
+  });
+  grip.addEventListener("pointerup", () => {
+    if (!drag) return;
+    drag = null;
+    grip.classList.remove("drag");
+    localStorage.setItem(KEY, Math.round(panel.getBoundingClientRect().width));
+  });
+  grip.addEventListener("dblclick", () => {
+    panel.style.width = "";
+    localStorage.removeItem(KEY);
+    window.dispatchEvent(new Event("resize"));
+  });
+}
 connect();
 
 // ---- Help boxes ------------------------------------------------------------
@@ -893,7 +1163,7 @@ let maskOn = false, maskDrawing = false, maskLast = null, spotPicking = false;
 
 function placeOverlay() {
   const pic = $("picture");
-  const show = !pic.hidden && pic.naturalWidth > 0;
+  const show = !pic.hidden && !!picBlob;
   overlay.style.display = show ? "block" : "none";
   if (!show) return;
   const v = view.getBoundingClientRect(), r = pic.getBoundingClientRect();
@@ -902,7 +1172,7 @@ function placeOverlay() {
   overlay.style.width = r.width + "px";
   overlay.style.height = r.height + "px";
   // A picture of another shape: the painted area no longer fits it.
-  if (maskData && Math.abs(maskData.width / maskData.height - pic.naturalWidth / pic.naturalHeight) > 0.03) {
+  if (maskData && Math.abs(maskData.width / maskData.height - pic.width / pic.height) > 0.03) {
     maskData = null;
     sendMask();
   }
@@ -948,6 +1218,7 @@ function sendMask() {
   }
   if (!any) { maskData = null; send({ t: "mask", w: 0, h: 0, bits: "" }); }
   else send({ t: "mask", w, h, bits });
+  if (keyState("mask") === "on") send({ t: "key_set", field: "mask", at: keyHead() });
 }
 
 function overlayPos(e) {
@@ -958,7 +1229,7 @@ function overlayPos(e) {
 function paintAt(e) {
   const pic = $("picture");
   if (!maskData) {
-    const a = pic.naturalWidth / pic.naturalHeight;
+    const a = pic.width / pic.height;
     maskData = document.createElement("canvas");
     maskData.width = a >= 1 ? MASK_LONG : Math.max(1, Math.round(MASK_LONG * a));
     maskData.height = a >= 1 ? Math.max(1, Math.round(MASK_LONG / a)) : MASK_LONG;
@@ -1026,6 +1297,170 @@ $("mask-paint").onclick = () => setMaskOn(!maskOn);
 $("mask-invert").onchange = () => { sendMask(); drawOverlay(); };
 $("mask-clear").onclick = () => { maskData = null; sendMask(); drawOverlay(); };
 $("rules-box").addEventListener("toggle", drawOverlay);
-$("picture").addEventListener("load", placeOverlay);
+// Measuring the picture on every status message made the browser redo the
+// page layout each time. Now the overlay moves only when a size changes.
+const picSizeWatch = new ResizeObserver(() => placeOverlay());
+picSizeWatch.observe($("picture"));
+picSizeWatch.observe(view);
 for (const k of ["c_x", "c_y"]) $(k).addEventListener("input", drawOverlay);
 showRuleRows();
+
+// ------------------------------------------------------- right-click menu
+// Right-click on a setting opens this menu. Shift + right-click still opens
+// the browser's own menu.
+
+const MENU_FIELDS = ALL.concat(["stop_match", "seed", "realtime", "loop_video", "c_shrink"]);
+// The second control of a setting: a slider or a color picker.
+const PARTNER = { alpha: "alpha-range", c_angle_deg: "c_angle_deg-range", work_size: "work-range", background: "background-pick" };
+const fieldMenu = $("field-menu");
+let copiedText = "";         // used when the browser blocks the clipboard
+
+// The setting under the mouse, "mask" for the painted area, or null.
+function menuField(target) {
+  const partner = Object.keys(PARTNER).find((f) => PARTNER[f] === target.id);
+  if (partner) return partner;
+  if (MENU_FIELDS.includes(target.id)) return target.id;
+  if (target.closest("#mask-row .pair")) return "mask";
+  const label = target.closest("label");
+  const inside = label ? [...label.querySelectorAll("input, select")].find((el) => MENU_FIELDS.includes(el.id)) : null;
+  return inside ? inside.id : null;
+}
+
+function shownDefault(f) { return f === "stop_match" ? (defaults[f] > 0 ? String(defaults[f]) : "") : defaults[f]; }
+function atDefault(f) {
+  const el = $(f), d = shownDefault(f);
+  if (f === "seed") return !$("seed_lock").checked;
+  if (el.type === "checkbox") return el.checked === !!d;
+  if (el.type === "number") return el.value === "" ? d === "" : Number(el.value) === Number(d);
+  return el.value === String(d);
+}
+function canReset(f) {
+  if (!defaults || !(f in defaults) || atDefault(f)) return false;
+  const el = $(f);
+  return el.tagName !== "SELECT" || [...el.options].some((o) => o.value === String(defaults[f]));
+}
+
+// Puts a value in a setting, the same way as a change by hand.
+function setField(f, value) {
+  const el = $(f);
+  if (el.type === "checkbox") el.checked = !!value;
+  else el.value = value;
+  const partner = PARTNER[f] && $(PARTNER[f]);
+  if (partner && (partner.type !== "color" || /^#[0-9a-fA-F]{6}$/.test(value))) partner.value = value;
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  showRuleRows();
+}
+function resetField(f) {
+  if (f !== "seed") { setField(f, shownDefault(f)); return; }
+  $("seed_lock").checked = false;
+  $("seed_lock").dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+async function clearKeys(f) {
+  const first = Math.min(...st.keys.tracks[f]);
+  if (st.shapes > first && !(await ask("clear-keys", `Clearing these keyframes keeps the first ${first} shapes and removes the rest.`, "Clear"))) return;
+  // Last key first: the final delete removes every shape made with the old keys.
+  const keys = st.keys.tracks[f] ? [...st.keys.tracks[f]].sort((a, b) => b - a) : [];
+  for (const at of keys) send({ t: "key_del", field: f, at });
+}
+
+async function copyField(f) {
+  copiedText = $(f).value;
+  try {
+    await navigator.clipboard.writeText(copiedText);
+  } catch (e) {
+    // The clipboard needs a secure page. Another device on the network does
+    // not get one, so copy the older way.
+    const box = document.createElement("textarea");
+    box.value = copiedText;
+    document.body.append(box);
+    box.select();
+    document.execCommand("copy");
+    box.remove();
+  }
+}
+async function pasteField(f) {
+  let text = copiedText;
+  try { text = await navigator.clipboard.readText(); } catch (e) { /* use the copied value */ }
+  text = text.trim();
+  if (!text) { tell("Nothing to paste. Click in the setting and press Ctrl+V."); return; }
+  const el = $(f), old = el.value;
+  el.value = text;
+  // A number field or a list gives an empty value for text it cannot use.
+  const usable = el.value;
+  el.value = old;
+  if (!usable) { tell(`"${text}" does not fit this setting.`); return; }
+  setField(f, usable);
+}
+
+function menuItems(f) {
+  const groups = [];
+  const el = f === "mask" ? null : $(f);
+  const locked = !!el && el.matches(":disabled");
+  if (el) groups.push([["Reset to default", () => resetField(f), locked || !canReset(f)]]);
+  if ((f === "mask" || KEYABLE.includes(f)) && st && st.kind === "image" && st.ready) {
+    groups.push([
+      [keyState(f) === "on" ? "Delete keyframe" : "Insert keyframe", () => toggleKey(f), !!st.render],
+      ["Clear keyframes", () => clearKeys(f), !!st.render || !keyState(f)],
+    ]);
+    // Only number settings that change smoothly have this switch.
+    const smooth = st.keys.smooth && st.keys.smooth[f];
+    if (smooth !== undefined) {
+      groups[groups.length - 1].push([smooth ? "Smooth change: on" : "Smooth change: off",
+        () => send({ t: "key_smooth", field: f, on: !smooth }), !!st.render]);
+    }
+  }
+  if (el && el.type !== "checkbox") {
+    groups.push([["Copy", () => copyField(f), !el.value], ["Paste", () => pasteField(f), locked]]);
+  }
+  return groups;
+}
+
+function closeFieldMenu() { fieldMenu.hidden = true; }
+function openFieldMenu(groups, x, y) {
+  fieldMenu.innerHTML = "";
+  groups.forEach((group, i) => {
+    if (i) fieldMenu.append(document.createElement("hr"));
+    for (const [label, run, off] of group) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.setAttribute("role", "menuitem");
+      b.textContent = label;
+      b.disabled = off;
+      b.onclick = () => { closeFieldMenu(); run(); };
+      fieldMenu.append(b);
+    }
+  });
+  fieldMenu.hidden = false;
+  fieldMenu.style.left = Math.max(4, Math.min(x, innerWidth - fieldMenu.offsetWidth - 4)) + "px";
+  fieldMenu.style.top = Math.max(4, Math.min(y, innerHeight - fieldMenu.offsetHeight - 4)) + "px";
+  fieldMenu.focus({ preventScroll: true });
+}
+
+$("panel").addEventListener("contextmenu", (e) => {
+  closeFieldMenu();
+  if (e.shiftKey) return;
+  const f = menuField(e.target);
+  if (!f) return;
+  // A value still being typed goes in first.
+  if (document.activeElement && document.activeElement.matches("input, select")) document.activeElement.blur();
+  const groups = menuItems(f);
+  if (!groups.length) return;
+  e.preventDefault();
+  openFieldMenu(groups, e.clientX, e.clientY);
+});
+fieldMenu.addEventListener("contextmenu", (e) => e.preventDefault());
+fieldMenu.addEventListener("keydown", (e) => {
+  e.stopPropagation();
+  if (e.key === "Escape" || e.key === "Tab") { e.preventDefault(); closeFieldMenu(); return; }
+  if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+  e.preventDefault();
+  const on = [...fieldMenu.querySelectorAll("button:not(:disabled)")];
+  if (!on.length) return;
+  const i = on.indexOf(document.activeElement);
+  on[e.key === "ArrowDown" ? (i + 1) % on.length : (i <= 0 ? on.length : i) - 1].focus();
+});
+document.addEventListener("pointerdown", (e) => { if (!fieldMenu.contains(e.target)) closeFieldMenu(); }, true);
+document.addEventListener("scroll", closeFieldMenu, true);
+window.addEventListener("resize", closeFieldMenu);
+window.addEventListener("blur", closeFieldMenu);

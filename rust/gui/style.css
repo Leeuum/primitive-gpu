@@ -90,7 +90,7 @@ input[type=color]::-moz-color-swatch { border: none; border-radius: 0; }
         border: 1px dashed transparent; overflow: hidden; background: var(--stage-bg); }
 #view.empty { border-color: var(--panel-line); }
 #view.dragover { border-color: var(--accent-light); background: #06101a; }
-#view img { max-width: 100%; max-height: 100%; object-fit: contain; image-rendering: auto; }
+#view img, #picture { max-width: 100%; max-height: 100%; object-fit: contain; image-rendering: auto; }
 #slot-view { position: absolute; inset: 0; margin: auto; width: 100%; height: 100%; object-fit: contain; background: var(--stage-bg); }
 #slots { position: absolute; top: 8px; left: 8px; display: flex; gap: 6px; z-index: 5; }
 .slot { position: relative; width: 72px; height: 48px; border: var(--border-w) solid var(--track-bg); background: var(--panel-bg); cursor: pointer; }
@@ -113,6 +113,23 @@ input[type=color]::-moz-color-swatch { border: none; border-radius: 0; }
 #info { white-space: pre; color: #c0bfbc; font-size: 12px; font-variant-numeric: tabular-nums; }
 #timeline-row { display: flex; align-items: center; gap: 10px; }
 #timeline { flex: 1; width: 100%; height: 34px; cursor: pointer; touch-action: none; }
+#timeline.still { height: 46px; }
+/* Every row ends at the same place. Keyed rows reach into the right gutter
+   of the panel so their dot sits there and their field keeps full width. */
+.keyed-row { position: relative; margin-right: -24px; padding-right: 24px; }
+.key-dot { display: none; position: absolute; right: 0; bottom: 4px; width: 18px; height: 18px; padding: 0; margin: 0;
+  background: none !important; border: 0 !important; cursor: pointer; }
+.has-keys .key-dot { display: block; }
+#mask-row .pair { position: relative; }
+.key-dot.in-pair { right: -24px; bottom: auto; top: 50%; transform: translateY(-50%); }
+.key-dot::before { content: ""; position: absolute; left: 6px; top: 6px; width: 6px; height: 6px; border-radius: 50%; background: #aaaaaa; }
+.key-dot:hover::before { background: #ffffff; }
+.key-dot.anim::before, .key-dot.on::before, .key-dot.changed::before { left: 5px; top: 5px; width: 6px; height: 6px; border-radius: 0;
+  transform: rotate(45deg); background: none; border: 1px solid #ffffff; }
+.key-dot.on::before { background: #ffffff; }
+#panel input.key-on, #panel select.key-on { background-color: #77691f; }
+#panel input.key-anim, #panel select.key-anim { background-color: #2f6b3a; }
+#panel input.key-changed, #panel select.key-changed { background-color: #a35c14; }
 #time { font-variant-numeric: tabular-nums; color: #c0bfbc; font-size: 12px; white-space: nowrap; }
 #render-row { color: #c0bfbc; font-size: 12px; }
 #error { background: #2a0000; border: var(--border-w) solid var(--danger); color: #fff; padding: 8px 12px; display: flex; gap: 10px; align-items: flex-start; }
@@ -120,14 +137,17 @@ input[type=color]::-moz-color-swatch { border: none; border-radius: 0; }
 #error button { background: none; border: none; font-size: 18px; padding: 0 4px; }
 
 /* --------------------------------------------------------------- panel */
-#panel { width: 320px; flex-shrink: 0; display: flex; flex-direction: column; background: var(--panel-bg);
-         border-left: var(--border-w) solid var(--panel-line); }
+#panel { width: 330px; flex-shrink: 0; display: flex; flex-direction: column; background: var(--panel-bg);
+         border-left: var(--border-w) solid var(--panel-line); position: relative; }
+/* Drag the panel's left edge to change its width. */
+#panel-grip { position: absolute; left: -4px; top: 0; bottom: 0; width: 8px; cursor: ew-resize; z-index: 5; touch-action: none; }
+#panel-grip:hover, #panel-grip.drag { background: linear-gradient(to right, transparent 3px, var(--accent-light) 3px, var(--accent-light) 5px, transparent 5px); }
 #panel-head { padding: 12px 14px; border-bottom: var(--border-w) solid var(--panel-line); flex: none; }
 #panel-head { display: flex; align-items: center; justify-content: space-between; }
 #panel-head strong { font-weight: 600; letter-spacing: .06em; }
 .head-buttons { display: flex; gap: 6px; }
 .head-buttons button { padding: 3px 10px; font-size: 12px; }
-#panel-body { flex: 1; overflow-y: auto; padding: 0 14px 12px; }
+#panel-body { flex: 1; overflow-y: auto; padding: 0 38px 12px 14px; }
 #panel-foot { flex: none; padding: 10px 14px 12px; border-top: var(--border-w) solid var(--panel-line); }
 
 #panel label { display: block; margin-bottom: 10px; color: var(--label); }
@@ -169,7 +189,8 @@ code { background: #222; color: #ddd; padding: 0 3px; font-size: 11px; font-fami
 @media (max-width: 760px) {
   #app { flex-direction: column; height: auto; }
   #stage { min-height: 70vh; }
-  #panel { width: auto; border-left: none; border-top: var(--border-w) solid var(--panel-line); }
+  #panel-grip { display: none; }
+  #panel { width: auto !important; border-left: none; border-top: var(--border-w) solid var(--panel-line); }
   #panel-body { overflow: visible; }
 }
 
@@ -182,6 +203,15 @@ code { background: #222; color: #ddd; padding: 0 3px; font-size: 11px; font-fami
 #ask .ask-buttons { display: flex; justify-content: flex-end; gap: 8px; }
 #ask .ask-buttons button { min-width: 90px; min-height: 32px; }
 #ask-reset { width: 100%; margin-top: 10px; }
+
+/* Menu that opens on a right-click on a setting. */
+#field-menu { position: fixed; z-index: 60; min-width: 170px; padding: 4px; background: var(--panel-bg); outline: none;
+              border: var(--border-w) solid var(--track-bg); box-shadow: 0 6px 24px #000c; }
+#field-menu button { display: block; width: 100%; min-height: 26px; padding: 3px 10px; margin: 0; text-align: left;
+                     background: transparent; border: none; border-radius: 0; color: var(--text); font: inherit; font-size: 12px; }
+#field-menu button:hover:not(:disabled), #field-menu button:focus-visible { background: var(--accent-dark); outline: none; }
+#field-menu button:disabled { color: var(--hint); cursor: default; }
+#field-menu hr { border: none; border-top: var(--border-w) solid var(--sec-line); margin: 4px 0; }
 
 /* Help box that opens when the mouse rests on a setting. */
 #tip { position: fixed; z-index: 50; width: 280px; background: #121212; border: var(--border-w) solid var(--track-bg);

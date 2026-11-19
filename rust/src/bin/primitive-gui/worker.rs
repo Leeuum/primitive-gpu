@@ -31,6 +31,82 @@ const PUBLISH_EVERY: Duration = Duration::from_millis(50);
 /// Largest temp file for decoded video frames.
 const MAX_DECODE_BYTES: f64 = 4.0e9;
 
+/// Settings that can have keyframes on the shape timeline of a still
+/// picture. "mask" is the painted area.
+const KEYABLE: &[&str] = &[
+    "mode", "alpha", "repeat", "c_angle", "c_angle_deg", "c_angle_step", "c_x", "c_y", "c_min_size", "c_max_size", "c_shrink", "c_min_ratio",
+    "c_max_ratio", "c_grid", "c_area", "chains", "random", "age", "k", MASK_KEY,
+];
+const MASK_KEY: &str = "mask";
+/// Number settings that change smoothly from one keyframe to the next. The
+/// other settings keep the value of the last keyframe until the next one.
+const BLENDED: &[&str] = &[
+    "alpha", "repeat", "c_angle_deg", "c_angle_step", "c_x", "c_y", "c_min_size", "c_max_size", "c_min_ratio", "c_max_ratio", "c_grid", "chains",
+    "random", "age", "k",
+];
+/// For these settings 0 means "off", so there is no smooth change to or
+/// from 0.
+const OFF_AT_ZERO: &[&str] = &["alpha", "c_min_size", "c_max_size", "c_min_ratio", "c_max_ratio", "c_grid"];
+
+/// A painted area: width, height, gray values.
+type MaskData = (usize, usize, Vec<u8>);
+
+/// The painted area in the form the search uses, kept until it changes.
+struct BuiltArea {
+    source: MaskData,
+    size: (i32, i32),
+    detail: bool,
+    mask: Option<Arc<Mask>>,
+    detail_map: Option<Arc<Detail>>,
+}
+
+/// The value `t` of the way (0 to 1) from key value `a` to key value `b`.
+/// None when this setting does not change smoothly.
+fn blend(field: &str, a: &serde_json::Value, b: &serde_json::Value, t: f64) -> Option<serde_json::Value> {
+    if !BLENDED.contains(&field) {
+        return None;
+    }
+    let (x, y) = (a.as_f64()?, b.as_f64()?);
+    if OFF_AT_ZERO.contains(&field) && (x == 0.0 || y == 0.0) {
+        return None;
+    }
+    let v = x + (y - x) * t;
+    Some(if a.is_f64() { json!((v * 100.0).round() / 100.0) } else { json!(v.round() as i64) })
+}
+
+/// The keyframes of one setting. A key at shape N is used from the moment
+/// N shapes are on the picture. Between two keys a number setting changes
+/// smoothly (see `blend`). For "mask" a value is a place in
+/// `Worker::key_masks`.
+struct Track {
+    /// The value before the first key: the one the build started with.
+    start: serde_json::Value,
+    keys: std::collections::BTreeMap<usize, serde_json::Value>,
+    /// False when the user turned the smooth change off: the value jumps
+    /// at each key.
+    smooth: bool,
+}
+
+impl Track {
+    fn value_at(&self, field: &str, n: usize) -> serde_json::Value {
+        let Some((&at, value)) = self.keys.range(..=n).next_back() else { return self.start.clone() };
+        let Some((&next, to)) = self.keys.range(n + 1..).next() else { return value.clone() };
+        if !self.smooth {
+            return value.clone();
+        }
+        blend(field, value, to, (n - at) as f64 / (next - at) as f64).unwrap_or_else(|| value.clone())
+    }
+
+    /// The first shape that a change to the key at `at` can affect: a
+    /// smooth change starts at the key before it.
+    fn affected_from(&self, field: &str, at: usize) -> usize {
+        match self.keys.range(..at).next_back() {
+            Some((&before, _)) if self.smooth && BLENDED.contains(&field) => before,
+            _ => at,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Settings {
@@ -276,6 +352,16 @@ pub enum Cmd {
     /// empty for no limit.
     Mask { w: usize, h: usize, gray: Vec<u8> },
     Seek(usize),
+    /// Still picture: move the timeline playhead to this shape number.
+    ShapeView(usize),
+    /// Keyframe a setting at a shape number, with its current value.
+    KeySet { field: String, at: usize },
+    KeyDelete { field: String, at: usize },
+    /// Turns the smooth change between keys of a setting on or off.
+    KeySmooth { field: String, on: bool },
+    /// Move every key at shape `from` to shape `to`.
+    KeyMove { from: usize, to: usize },
+    GetMask(oneshot::Sender<Option<MaskData>>),
     Render,
     Cancel,
     DismissError,
@@ -320,7 +406,7 @@ impl PicSlot {
 }
 
 pub fn jpeg(rgba: &image::RgbaImage, quality: u8) -> Vec<u8> {
-    let rgb = image::DynamicImage::ImageRgba8(rgba.clone()).to_rgb8();
+    let rgb: image::RgbImage = image::buffer::ConvertBuffer::convert(rgba);
     let mut out = Vec::new();
     let _ = JpegEncoder::new_with_quality(&mut out, quality).encode_image(&rgb);
     out
@@ -556,6 +642,20 @@ pub struct Worker {
     /// Restart with a new working size: the frame the playhead was on, to
     /// go back to when the video is decoded again.
     restart_view: Option<usize>,
+    built_area: Option<BuiltArea>,
+    /// Still picture: the keyframes of each setting.
+    tracks: std::collections::BTreeMap<String, Track>,
+    /// The painted areas that keyframes use.
+    key_masks: Vec<Option<MaskData>>,
+    /// Settings and painted area at the start of the build.
+    start_state: (Settings, Option<MaskData>),
+    /// Still picture: the shape number the user moved the playhead to.
+    /// None = the playhead follows the build.
+    shape_view: Option<usize>,
+    /// The keyed values now in use. None = apply them again.
+    key_sig: Option<serde_json::Value>,
+    /// Goes up when a keyframe changes the painted area.
+    mask_rev: u64,
 }
 
 fn bg_from(background: &str, target: &[u8]) -> [u8; 4] {
@@ -648,6 +748,13 @@ impl Worker {
             shown_cached: None,
             loop_pass: LoopState::Idle,
             restart_view: None,
+            built_area: None,
+            tracks: Default::default(),
+            key_masks: Vec::new(),
+            start_state: (Settings::default(), None),
+            shape_view: None,
+            key_sig: None,
+            mask_rev: 0,
         }
     }
 
@@ -661,7 +768,10 @@ impl Worker {
     /// Runs until `Quit` or until the server goes away.
     pub fn run(&mut self) {
         loop {
-            let wait = self.idle_wait();
+            // A picture or status that is waiting for its turn must not wait
+            // for the idle time as well.
+            let due = PUBLISH_EVERY.saturating_sub(self.last_publish.elapsed());
+            let wait = self.idle_wait().map(|d| if self.dirty_pic || self.dirty_status { d.min(due) } else { d });
             let first = match wait {
                 None => self.rx.try_recv().ok(),
                 Some(d) => match self.rx.recv_timeout(d) {
@@ -672,9 +782,14 @@ impl Worker {
             };
             let mut cmds: Vec<Cmd> = first.into_iter().collect();
             cmds.extend(self.rx.try_iter());
-            for c in cmds {
+            let mut cmds = cmds.into_iter().peekable();
+            while let Some(c) = cmds.next() {
                 if matches!(c, Cmd::Quit) {
                     return self.shutdown();
+                }
+                // A timeline drag: only the newest position matters.
+                if matches!(c, Cmd::ShapeView(_)) && matches!(cmds.peek(), Some(Cmd::ShapeView(_))) {
+                    continue;
                 }
                 self.command(c);
             }
@@ -916,6 +1031,11 @@ impl Worker {
                 if self.render.is_some() {
                     return;
                 }
+                if self.shape_view.take().is_some() {
+                    self.dirty_pic = true;
+                    self.key_sig = None;
+                    self.sync_keys();
+                }
                 if let Source::Image(_) = self.source {
                     if self.full() {
                         return;
@@ -985,7 +1105,195 @@ impl Worker {
             Cmd::Export(reply) => {
                 let _ = reply.send(self.export_data());
             }
+            Cmd::ShapeView(n) => {
+                if self.render.is_none() {
+                    self.view_shape(n);
+                }
+            }
+            Cmd::KeySet { field, at } => {
+                if self.render.is_none() {
+                    self.key_set(field, at);
+                }
+            }
+            Cmd::KeyDelete { field, at } => {
+                if self.render.is_none() {
+                    self.key_delete(&field, at);
+                }
+            }
+            Cmd::KeySmooth { field, on } => {
+                if self.render.is_none() {
+                    self.key_smooth(&field, on);
+                }
+            }
+            Cmd::KeyMove { from, to } => {
+                if self.render.is_none() {
+                    self.key_move(from, to);
+                }
+            }
+            Cmd::GetMask(reply) => {
+                let _ = reply.send(self.mask.clone());
+            }
             Cmd::Quit => {}
+        }
+    }
+
+    // ------------------------------------------------------------ keyframes
+
+    /// The value of every keyed setting when `n` shapes are on the picture.
+    fn keyed_values(&self, n: usize) -> serde_json::Map<String, serde_json::Value> {
+        self.tracks.iter().map(|(f, t)| (f.clone(), t.value_at(f, n))).collect()
+    }
+
+    /// Shows values of keyed settings on the page. The search does not use
+    /// them until `use_values`.
+    fn set_values(&mut self, values: serde_json::Map<String, serde_json::Value>) {
+        if let Ok(serde_json::Value::Object(mut s)) = serde_json::to_value(&self.settings) {
+            for (f, v) in values.iter().filter(|(f, _)| *f != MASK_KEY) {
+                s.insert(f.clone(), v.clone());
+            }
+            if let Ok(new) = serde_json::from_value::<Settings>(serde_json::Value::Object(s)) {
+                self.settings = new.clamped();
+            }
+        }
+        if let Some(id) = values.get(MASK_KEY).and_then(|v| v.as_u64()) {
+            let mask = self.key_masks.get(id as usize).cloned().flatten();
+            if mask != self.mask {
+                self.mask = mask;
+                self.mask_rev += 1;
+            }
+        }
+        self.dirty_status = true;
+    }
+
+    /// Puts values of keyed settings into use.
+    fn use_values(&mut self, values: serde_json::Map<String, serde_json::Value>) {
+        self.set_values(values);
+        if let Some(m) = &mut self.model {
+            m.set_search(self.settings.search());
+        }
+        self.push_constraints();
+    }
+
+    /// Before a shape is added: use the keyed values for this shape number.
+    fn sync_keys(&mut self) {
+        if !matches!(self.source, Source::Image(_)) {
+            return;
+        }
+        let values = self.keyed_values(self.shape_count());
+        let sig = serde_json::Value::Object(values.clone());
+        if self.key_sig.as_ref() != Some(&sig) {
+            self.use_values(values);
+            self.key_sig = Some(sig);
+        }
+    }
+
+    fn view_shape(&mut self, n: usize) {
+        if !matches!(self.source, Source::Image(_)) || self.model.is_none() {
+            return;
+        }
+        let n = n.min(self.settings.count);
+        self.playing = false;
+        self.shape_view = Some(n);
+        self.set_values(self.keyed_values(n));
+        self.key_sig = None;
+        self.dirty_pic = true;
+    }
+
+    /// A place in `key_masks` for this painted area.
+    fn mask_id(&mut self, mask: Option<MaskData>) -> usize {
+        if let Some(i) = self.key_masks.iter().position(|m| *m == mask) {
+            return i;
+        }
+        self.key_masks.push(mask);
+        self.key_masks.len() - 1
+    }
+
+    /// Shapes after a changed key were made for the old settings, so they
+    /// go. The shapes before it stay. The playhead stays where it is, and
+    /// the build goes on from there when the user presses Play.
+    fn rebuild_from(&mut self, n: usize) {
+        self.key_sig = None;
+        let playing = self.playing;
+        let Some(m) = &mut self.model else { return };
+        let len = m.shapes.len();
+        if n < len {
+            m.truncate(n);
+            if !playing && self.shape_view.is_none() {
+                self.shape_view = Some(len);
+            }
+            self.dirty_pic = true;
+        }
+    }
+
+    /// The page shows the values at the playhead after keys changed.
+    fn show_head_values(&mut self) {
+        let head = self.shape_view.unwrap_or(self.shape_count());
+        self.set_values(self.keyed_values(head));
+    }
+
+    fn key_set(&mut self, field: String, at: usize) {
+        if !KEYABLE.contains(&field.as_str()) || !matches!(self.source, Source::Image(_)) {
+            return;
+        }
+        let at = at.min(self.settings.count.saturating_sub(1));
+        let (value, start) = if field == MASK_KEY {
+            let (now, first) = (self.mask.clone(), self.start_state.1.clone());
+            (json!(self.mask_id(now)), json!(self.mask_id(first)))
+        } else {
+            let value_of = |s: &Settings| serde_json::to_value(s).map(|v| v[field.as_str()].clone()).unwrap_or_default();
+            (value_of(&self.settings), value_of(&self.start_state.0))
+        };
+        let from = self.tracks.get(&field).map_or(at, |t| t.affected_from(&field, at));
+        let track = self.tracks.entry(field).or_insert_with(|| Track { start, keys: Default::default(), smooth: true });
+        if track.keys.get(&at) != Some(&value) {
+            track.keys.insert(at, value);
+            self.rebuild_from(from);
+        }
+    }
+
+    fn key_delete(&mut self, field: &str, at: usize) {
+        let Some(track) = self.tracks.get_mut(field) else { return };
+        let from = track.affected_from(field, at);
+        if track.keys.remove(&at).is_none() {
+            return;
+        }
+        // The last key of a setting is gone: back to the starting value.
+        if track.keys.is_empty() {
+            let start = track.start.clone();
+            self.tracks.remove(field);
+            self.use_values(std::iter::once((field.to_string(), start)).collect());
+        }
+        self.rebuild_from(from);
+        self.show_head_values();
+    }
+
+    fn key_smooth(&mut self, field: &str, on: bool) {
+        let Some(track) = self.tracks.get_mut(field) else { return };
+        if track.smooth == on || !BLENDED.contains(&field) {
+            return;
+        }
+        track.smooth = on;
+        let first = track.keys.keys().next().copied().unwrap_or(0);
+        self.rebuild_from(first);
+        self.show_head_values();
+    }
+
+    fn key_move(&mut self, from: usize, to: usize) {
+        let to = to.min(self.settings.count.saturating_sub(1));
+        if from == to {
+            return;
+        }
+        let mut first = None;
+        for (f, t) in self.tracks.iter_mut() {
+            let affected = t.affected_from(f, from).min(t.affected_from(f, to));
+            if let Some(v) = t.keys.remove(&from) {
+                t.keys.insert(to, v);
+                first = Some(first.map_or(affected, |n: usize| n.min(affected)));
+            }
+        }
+        if let Some(n) = first {
+            self.rebuild_from(n);
+            self.show_head_values();
         }
     }
 
@@ -1149,6 +1457,10 @@ impl Worker {
         self.rt_due = None;
         self.shown_cached = None;
         self.loop_pass = LoopState::Idle;
+        self.tracks.clear();
+        self.key_masks.clear();
+        self.shape_view = None;
+        self.key_sig = None;
     }
 
     fn load(&mut self, path: PathBuf, name: String) {
@@ -1237,13 +1549,25 @@ impl Worker {
             return;
         };
         let mut c = self.settings.constraints();
-        if let Some((sw, sh, src)) = &self.mask {
-            let (w, h) = (m.w as usize, m.h as usize);
-            let gray: Vec<u8> = (0..w * h).map(|i| src[(i / w * sh / h) * sw + (i % w) * sw / w]).collect();
-            if self.settings.c_area == "detail" {
-                c.detail = Detail::new(m.w, m.h, &gray).map(std::sync::Arc::new);
-            } else {
-                c.mask = Mask::new(m.w, m.h, &gray).map(std::sync::Arc::new);
+        if let Some(mask) = &self.mask {
+            // Smooth keyframes come here for every shape. Making the area
+            // again each time would slow the build down.
+            let detail = self.settings.c_area == "detail";
+            let size = (m.w, m.h);
+            if !self.built_area.as_ref().is_some_and(|b| b.source == *mask && b.size == size && b.detail == detail) {
+                let (sw, sh, src) = mask;
+                let (w, h) = (m.w as usize, m.h as usize);
+                let gray: Vec<u8> = (0..w * h).map(|i| src[(i / w * sh / h) * sw + (i % w) * sw / w]).collect();
+                let (made_mask, made_detail) = if detail {
+                    (None, Detail::new(m.w, m.h, &gray).map(std::sync::Arc::new))
+                } else {
+                    (Mask::new(m.w, m.h, &gray).map(std::sync::Arc::new), None)
+                };
+                self.built_area = Some(BuiltArea { source: mask.clone(), size, detail, mask: made_mask, detail_map: made_detail });
+            }
+            if let Some(b) = &self.built_area {
+                c.mask = b.mask.clone();
+                c.detail = b.detail_map.clone();
             }
         }
         m.set_constraints(c);
@@ -1273,28 +1597,62 @@ impl Worker {
         }
     }
 
+    /// "Restart" of a still picture when the working size and the score are
+    /// the same: no need to read the file or set up the GPU again.
+    fn reuse_model(&mut self) -> bool {
+        let key = self.settings.restart_key();
+        if key.0 != self.applied.0 || key.3 != self.applied.3 {
+            return false;
+        }
+        let Some(m) = &self.model else { return false };
+        let (bg, seed) = (self.bg_for(m.target()), self.seed());
+        let search = self.settings.search();
+        let Some(m) = &mut self.model else { return false };
+        m.set_search(search);
+        m.restart(bg, seed);
+        self.used_seed = seed;
+        self.build_time = Duration::ZERO;
+        self.push_constraints();
+        self.rt_due = None;
+        self.applied = key;
+        self.dirty_pic = true;
+        true
+    }
+
     /// (Re)starts the search on the loaded image. `fresh_file` sets the
     /// output size to the picture's own size.
     fn start_image(&mut self, fresh_file: bool) {
-        let Source::Image(src) = &self.source else { return };
-        let img = match load::open_image(&src.path.to_string_lossy()) {
-            Ok(i) => i,
-            Err(e) => {
-                let name = src.name.clone();
-                let e = e.replace(&format!("{}: ", src.path.display()), "");
-                self.clear_source();
-                self.fail(format!("Could not read {name}. It is not a picture or video this program can open. ({e})"));
-                return;
-            }
-        };
-        if fresh_file {
-            self.src_dims = (img.width(), img.height());
-            self.resolve_out();
-            self.fix_format();
+        if !matches!(self.source, Source::Image(_)) {
+            return;
         }
-        let img = load::shrink(img, self.settings.work_size);
-        let (target, w, h) = load::premultiplied(&img);
-        if self.new_model(target, w, h) {
+        let started = if !fresh_file && self.reuse_model() {
+            true
+        } else {
+            let Source::Image(src) = &self.source else { return };
+            let img = match load::open_image(&src.path.to_string_lossy()) {
+                Ok(i) => i,
+                Err(e) => {
+                    let name = src.name.clone();
+                    let e = e.replace(&format!("{}: ", src.path.display()), "");
+                    self.clear_source();
+                    self.fail(format!("Could not read {name}. It is not a picture or video this program can open. ({e})"));
+                    return;
+                }
+            };
+            if fresh_file {
+                self.src_dims = (img.width(), img.height());
+                self.resolve_out();
+                self.fix_format();
+            }
+            let img = load::shrink(img, self.settings.work_size);
+            let (target, w, h) = load::premultiplied(&img);
+            self.new_model(target, w, h)
+        };
+        self.shape_view = None;
+        self.key_sig = None;
+        self.sync_keys();
+        self.start_state = (self.settings.clone(), self.mask.clone());
+        if started {
             self.playing = true;
         }
     }
@@ -1508,13 +1866,17 @@ impl Worker {
     }
 
     fn step(&mut self) {
+        self.sync_keys();
+        let len = self.shape_count();
+        // Extra shapes stop at the next keyframe.
+        let next_key = self.tracks.values().filter_map(|t| t.keys.range(len + 1..).next().map(|(at, _)| *at)).min();
         let s = &self.settings;
         let (mode, alpha, repeat, count) = (s.mode, s.alpha, s.repeat, s.count);
         if let Some(m) = &mut self.model {
             let t0 = Instant::now();
             // Extra shapes stop at the shape count. Cutting shapes afterwards
             // would lose the picture a "build on" frame started from.
-            let room = count.saturating_sub(m.shapes.len() + 1);
+            let room = count.saturating_sub(m.shapes.len() + 1).min(next_key.map_or(usize::MAX, |at| at - len - 1));
             m.step(mode, alpha, repeat.min(room));
             self.build_time += t0.elapsed();
             self.dirty_pic = true;
@@ -2093,6 +2455,14 @@ impl Worker {
         let shown = self.shown_stats();
         json!({
             "settings": self.settings,
+            "keys": {
+                "head": self.shape_view.unwrap_or(self.shape_count()),
+                "viewing": self.shape_view.is_some(),
+                "mask_rev": self.mask_rev,
+                "values": self.keyed_values(self.shape_view.unwrap_or(self.shape_count())),
+                "smooth": self.tracks.iter().filter(|(f, _)| BLENDED.contains(&f.as_str())).map(|(f, t)| (f.clone(), t.smooth)).collect::<std::collections::BTreeMap<_, _>>(),
+                "tracks": self.tracks.iter().map(|(f, t)| (f.clone(), t.keys.keys().copied().collect::<Vec<_>>())).collect::<std::collections::BTreeMap<_, _>>(),
+            },
             "needs_restart": m.is_some() && self.needs_restart(),
             "seed": m.map(|_| self.used_seed.to_string()),
             "kind": kind,
@@ -2146,7 +2516,9 @@ impl Worker {
     }
 
     fn publish_picture(&mut self) {
-        let Some(m) = &self.model else { return };
+        if self.model.is_none() {
+            return;
+        }
         if let (true, Source::Video(v)) = (self.settings.build_on, &self.source) {
             if v.view < v.frontier {
                 if self.shown_cached == Some(v.view) {
@@ -2163,6 +2535,12 @@ impl Worker {
             }
         }
         self.shown_cached = None;
-        self.pics.put(Pic::Raw(m.canvas.clone()));
+        let view = self.shape_view;
+        let Some(m) = &mut self.model else { return };
+        let pic = match view {
+            Some(n) => m.canvas_at(n),
+            None => m.canvas.clone(),
+        };
+        self.pics.put(Pic::Raw(pic));
     }
 }

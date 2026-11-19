@@ -157,6 +157,10 @@ pub struct Timings {
 
 /// Batches up to this size are prepared on the calling thread.
 const SERIAL_MAX: usize = 1024;
+/// Most preview canvases that `Model::canvas_at` keeps.
+const MARKS: usize = 16;
+/// Fewest shapes between two saved preview canvases.
+const MARK_MIN: usize = 64;
 
 /// Make several batches of GPU shape records and join them into one batch.
 /// Batch `b` holds `counts[b]` states made by `gen(b, i, rng)` and uses
@@ -366,6 +370,10 @@ pub struct Model {
     climbing: bool,
     /// Random shapes for the next step, being made in the background.
     pregen: Option<(RandomKey, mpsc::Receiver<(Vec<Batch>, f64)>)>,
+    /// Saved preview canvases for `canvas_at`: the first holds the picture
+    /// after `marks_every` shapes, the next after twice as many, and so on.
+    marks: Vec<Pixmap>,
+    marks_every: usize,
 }
 
 impl Model {
@@ -407,6 +415,8 @@ impl Model {
             joined: false,
             climbing: false,
             pregen: None,
+            marks: Vec::new(),
+            marks_every: 0,
         })
     }
 
@@ -472,11 +482,26 @@ impl Model {
         };
         self.current = current;
         self.canvas = canvas;
+        self.marks.clear();
         self.total = difference_full(self.cfg.metric, &self.target, &self.current);
         self.score = score_of(self.cfg.metric, self.total, self.w, self.h);
         self.shapes.clear();
         self.colors.clear();
         self.scores.clear();
+    }
+
+    /// Start a new build of the same picture on the GPU setup that already
+    /// exists. Gives the same shapes as a new `Model` with this seed.
+    pub fn restart(&mut self, bg: [u8; 4], seed: u64) {
+        self.bg = bg;
+        self.rng = Rng::new(seed);
+        self.pregen = None;
+        self.counter = 0;
+        self.times = Timings::default();
+        self.check = CheckStats::default();
+        self.check_pending = Default::default();
+        self.reset(None);
+        self.gpu.set_current(&self.current);
     }
 
     /// Put back saved shapes after `set_target`: draws them with the exact
@@ -511,6 +536,32 @@ impl Model {
         // which load_shapes does.
         self.reset(None);
         self.load_shapes(&shapes, &colors, &scores);
+    }
+
+    /// The preview canvas as it looked after the first `n` shapes.
+    /// Starts from the nearest saved canvas, so that dragging along the
+    /// timeline does not draw every shape again each time.
+    pub fn canvas_at(&mut self, n: usize) -> Pixmap {
+        let n = n.min(self.shapes.len());
+        if n == self.shapes.len() {
+            return self.canvas.clone();
+        }
+        let every = (self.shapes.len() / MARKS).max(MARK_MIN);
+        if every != self.marks_every {
+            self.marks.clear();
+            self.marks_every = every;
+        }
+        let blank = Self::new_canvas(self.sw.max(1), self.sh.max(1), self.bg);
+        let want = n / every;
+        while self.marks.len() < want {
+            let k = self.marks.len();
+            let mut p = self.marks.last().unwrap_or(&blank).clone();
+            draw_shapes(&mut p, &self.shapes[k * every..(k + 1) * every], &self.colors[k * every..(k + 1) * every], self.scale);
+            self.marks.push(p);
+        }
+        let mut p = if want == 0 { blank } else { self.marks[want - 1].clone() };
+        draw_shapes(&mut p, &self.shapes[want * every..n], &self.colors[want * every..n], self.scale);
+        p
     }
 
     /// GPU-drawing path: make several batches in one go and join them into

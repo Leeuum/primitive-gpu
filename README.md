@@ -2,7 +2,7 @@
 
 Rebuild any picture from simple shapes (triangles, rectangles, circles, curves and more), one shape at a time.
 
-A Rust port of Michael Fogleman's [primitive](https://github.com/fogleman/primitive) that scores candidate shapes on the graphics card with [wgpu](https://wgpu.rs): about 3.6 million triangles per second on an RTX 2060 (`-vv` prints the rate on your machine). It has two programs: the command-line `primitive-gpu`, with the original's flags plus a few new ones, and `primitive-gui`, a browser interface for pictures, videos and image sequences.
+A Rust port of Michael Fogleman's [primitive](https://github.com/fogleman/primitive) that scores candidate shapes on the graphics card with [wgpu](https://wgpu.rs): about 5 million tries per second on an RTX 2060, and one shape takes roughly 25,000 tries (`-vv` prints the rate on your machine). It has two programs: the command-line `primitive-gpu`, with the original's flags plus a few new ones, and `primitive-gui`, a browser interface for pictures, videos and image sequences.
 
 ![The browser GUI building a video frame by frame with rotated rectangles](docs/images/gui.jpg)
 
@@ -70,7 +70,7 @@ Average time for 50 shapes at a 256-pixel working size (Ryzen 7 2700, RTX 2060):
 
 | Shape | combo | triangle | rect | ellipse | circle | rotated rect | curve | rotated ellipse | polygon |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Seconds | 0.57 | 0.36 | 0.18 | 0.26 | 0.23 | 0.23 | 1.01 | 0.72 | 0.64 |
+| Seconds | 0.33 | 0.33 | 0.17 | 0.19 | 0.16 | 0.21 | 0.53 | 0.38 | 0.37 |
 
 Compared with the original Go program on the same machine (200 shapes of one kind on `examples/monalisa.png`, default settings, whole run including start-up and saving, all CPU cores for the original). Both reach about the same final score:
 

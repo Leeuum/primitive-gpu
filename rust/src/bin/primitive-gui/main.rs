@@ -218,6 +218,8 @@ async fn serve(port: u16, open: bool) {
         .route("/upload", post(upload).layer(DefaultBodyLimit::disable()))
         .route("/ws", get(ws))
         .route("/original", get(original))
+        .route("/mask", get(key_mask))
+        .route("/defaults", get(|| async { ([(header::CONTENT_TYPE, "application/json")], serde_json::json!(Settings::default()).to_string()) }))
         .route("/export", get(export))
         .route("/download/{name}", get(download))
         .route("/sequence", post(sequence))
@@ -490,11 +492,28 @@ fn parse_command(text: &str) -> Option<Cmd> {
             Cmd::Mask { w, h, gray: bits.bytes().map(|b| if b == b'1' { 255 } else { 0 }).collect() }
         }
         "seek" => Cmd::Seek(v["frame"].as_u64()? as usize),
+        "shape_view" => Cmd::ShapeView(v["at"].as_u64()? as usize),
+        "key_set" => Cmd::KeySet { field: v["field"].as_str()?.to_string(), at: v["at"].as_u64()? as usize },
+        "key_del" => Cmd::KeyDelete { field: v["field"].as_str()?.to_string(), at: v["at"].as_u64()? as usize },
+        "key_smooth" => Cmd::KeySmooth { field: v["field"].as_str()?.to_string(), on: v["on"].as_bool()? },
+        "key_move" => Cmd::KeyMove { from: v["from"].as_u64()? as usize, to: v["to"].as_u64()? as usize },
         "render" => Cmd::Render,
         "cancel" => Cmd::Cancel,
         "dismiss" => Cmd::DismissError,
         _ => return None,
     })
+}
+
+/// The painted area in use now. The page asks for it when a keyframe has
+/// changed the area.
+async fn key_mask(State(app): State<App>) -> Response {
+    let (tx, rx) = oneshot::channel();
+    app.send(Cmd::GetMask(tx));
+    let (w, h, bits) = match rx.await.ok().flatten() {
+        Some((w, h, gray)) => (w, h, gray.iter().map(|&b| if b >= 128 { '1' } else { '0' }).collect()),
+        None => (0, 0, String::new()),
+    };
+    ([(header::CONTENT_TYPE, "application/json")], serde_json::json!({ "w": w, "h": h, "bits": bits }).to_string()).into_response()
 }
 
 async fn original(State(app): State<App>) -> Response {
