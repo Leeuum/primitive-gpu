@@ -4,13 +4,13 @@ Rebuild any picture from simple shapes (triangles, rectangles, circles, curves a
 
 A Rust port of Michael Fogleman's [primitive](https://github.com/fogleman/primitive) that scores candidate shapes on the graphics card with [wgpu](https://wgpu.rs): about 5 million tries per second on an RTX 2060, and one shape takes roughly 25,000 tries (`-vv` prints the rate on your machine). It has two programs: the command-line `primitive-gpu`, with the original's flags plus a few new ones, and `primitive-gui`, a browser interface for pictures, videos and image sequences.
 
-**About 7 to 9 times faster than the original.** The same photo, 1000 rotated rectangles at alpha 210, with the clocks in real time. The top row is the original Go program on a Ryzen 7 2700 (16 threads), and the bottom row is primitive-gpu on an RTX 2060. The search picture is 256 pixels on the left and 1024 on the right ([full-quality MP4](https://github.com/Leeuum/primitive-gallery/blob/main/images/speed-taxi.mp4)):
-
-<a href="https://github.com/Leeuum/primitive-gallery/blob/main/images/speed-taxi.mp4"><img src="https://raw.githubusercontent.com/Leeuum/primitive-gallery/main/images/speed-taxi.gif" width="100%" alt="Four copies of a red taxi building up from rectangles: the original program takes 16.80 s and 44.92 s, primitive-gpu takes 2.27 s and 4.78 s"></a>
-
 ![The browser GUI building a video frame by frame with rotated rectangles](docs/images/gui.jpg)
 
 ## What's new compared to the original
+
+**About 7 to 9 times faster than the original.** The same photo, 1000 rotated rectangles at alpha 210, with the clocks in real time. The top row is the original Go program on a Ryzen 7 2700 (16 threads), and the bottom row is primitive-gpu on an RTX 2060. The search picture is 256 pixels on the left and 1024 on the right ([full-quality MP4](https://github.com/Leeuum/primitive-gallery/blob/main/images/speed-taxi.mp4)):
+
+<a href="https://github.com/Leeuum/primitive-gallery/blob/main/images/speed-taxi.mp4"><img src="https://raw.githubusercontent.com/Leeuum/primitive-gallery/main/images/speed-taxi.gif" width="100%" alt="Four copies of a red taxi building up from rectangles: the original program takes 16.80 s and 44.92 s, primitive-gpu takes 2.27 s and 4.78 s"></a>
 
 - **Video.** Scoring on the graphics card makes a whole video practical, not just a single picture. Give the GUI a video or an image sequence and it rebuilds every frame. In "build on" mode each frame adds new shapes over the frame before, so the picture changes smoothly instead of flickering; in "fresh" mode every frame starts empty and the shapes jump around.
 
