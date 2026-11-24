@@ -24,9 +24,9 @@ A Rust port of Michael Fogleman's [primitive](https://github.com/fogleman/primit
 
   ![A red taxi rebuilt nine times with different shape rules: one angle, angle steps, point at a spot, rings around a spot, snap to a grid, a mask around the taxi, a detail map, a high minimum length, and a minimum length that rises during the build](docs/images/rules-3x3.jpg)
 
-- **Change settings mid-build.** Pause a picture while it builds, change the settings, and carry on. The shapes already placed stay, and new shapes follow the new settings, so one picture can mix several looks: big, rough shapes for the base, then fine detail in just the area you paint.
+- **Keyframes: change settings during a build.** A timeline under the picture counts the shapes, like the frames in an animation program. Click the dot beside a setting to set a keyframe at the playhead, and the build switches to that value when it reaches that shape. Number settings change smoothly between two keyframes. One picture can mix several looks: big, rough shapes for the base, then fine detail in just the area you paint. The painted area can have keyframes too. Drag the playhead back to see an earlier stage. Change or move a keyframe and only the shapes after it are built again. Restart plays the same keyframes again, so you set them up once and try as many seeds as you like. Still pictures only for now.
 
-- **A browser GUI.** It works from any device on your network. Hover over a setting to see what it does. Snapshots keep up to 8 results to flick between (keys 1 to 8), and a build timer shows how long each result took, so settings are easy to compare. Export at any size up to 4K without searching again. Render straight to MP4, WebM (with the original sound), GIF or an image sequence.
+- **A browser GUI.** With `-lan` it works from any device on your network. Hover over a setting to see what it does. Snapshots keep up to 8 results to flick between (keys 1 to 8), and a build timer shows how long each result took, so settings are easy to compare. Export at any size up to 4K without searching again. Render straight to MP4, WebM (with the original sound), GIF or an image sequence. Save your work to a file and carry on later. PNG and SVG exports carry the settings and keyframes they were made with, so anyone can drop one onto the page and use the same recipe.
 
 ## Gallery
 
@@ -160,19 +160,24 @@ GIF output animates the shapes being added. With `%d` in a PNG, JPG or SVG name,
 cd rust
 target/release/primitive-gui            # opens http://localhost:8640 in the browser
 target/release/primitive-gui -port 9000 -j 8 -no-open
+target/release/primitive-gui -lan        # also lets your phone or laptop open the page
 ```
 
-The page works from any device on the same network.
+By default only this computer can open the page. With `-lan`, any device on the same network can use it, and the program prints the address to open there.
 
-- **Input:** an image, a video, or a folder of pictures (an image sequence).
+- **Input:** an image, a video, or a folder of pictures (an image sequence). "Open…" shows the pictures and videos in the home folder of the computer the program runs on, or uploads files from the device you use.
 - **Stopping:** "Shapes" sets the most shapes per picture, "Stop at match" stops a picture once that much of it is matched (in percent, so dark and bright frames end up equally finished), "Lowest score" lets dark or nearly flat frames stop early, and "Fewest shapes" sets the least shapes a picture gets before that.
 - **Shape rules:** the same creative rules as the command line (direction, size, proportions, grid), plus an area that you paint on the picture. The painted area either keeps the shapes inside it, or marks where the small shapes go while the rest gets big shapes.
-- **Export:** PNG, JPG, SVG or a timelapse, at any size up to 4K without a new search.
+- **Keyframes (still pictures):** the shape timeline under the picture has a numbered playhead. The dot beside a setting, or beside the painted area, sets a keyframe at the playhead. Its colour shows the state: yellow means a keyframe on this shape, green means keyframes elsewhere, and orange means the value changed but has no keyframe. Number settings change smoothly between keyframes. Changing, moving or deleting a keyframe keeps the shapes before it and builds the rest again when you press Play. Right-click a setting to reset it, insert or delete a keyframe, clear its keyframes, or copy and paste its value.
+- **Export:** PNG, JPG, SVG or a timelapse, at any size up to 4K without a new search. A still picture exports the shapes up to the playhead.
+- **Save files:** Save in the settings panel writes a `.primitive` file to go on with your work later: the settings, the keyframes, the painted areas, the shapes made so far on a still picture, and where the source file is on the computer. Tick "Include original picture" to put a copy of the picture in it too. Videos are never copied in, and they build again from the start. If the source has moved, the program asks you to find it. A save file holds a folder path, so it is for your own use.
+- **Where files go:** the first time you press Save, Export or Render, the file browser asks for a folder (inside your home folder) and can make a new one. Tick "Always use this folder" and that button uses it from then on; each button keeps its own folder, and the Export section lists them to change or forget. If a file of the same name is there, Save and Export ask whether to overwrite it or save a new one next to it. "Download to this device" sends the file to the browser instead, which is handy from a phone.
+- **Recipes:** PNG and SVG exports hold their recipe: the settings, the keyframes and the painted areas, with no file names, so it is safe to share. Drop one onto the page to open it with or without its recipe, or pick it with Load to put its recipe on the picture you have open. Load also takes older recipe `.json` files. Websites and chat apps often remove this data from pictures, so send the file itself (for example in a zip) to keep it.
 - **Videos:** every loop adds more shapes to each frame. Each frame can start fresh or build on the one before.
 - **Loop video:** in "build on" mode, makes a video that joins up when it plays in a loop. Every frame is built a second time, starting on the last frame's picture, so the end turns into the start like any other two frames.
-- **Render:** saves an MP4 or WebM (with the original sound), a GIF, or an image sequence to `primitive` in your Videos folder (Movies on a Mac). Existing files are never overwritten.
+- **Render:** saves an MP4 or WebM (with the original sound), a GIF, or an image sequence into the folder you pick. "Download to this device" saves it to `primitive` in your Videos folder (Movies on a Mac) and downloads it. Existing renders are never overwritten.
 
-**Security:** the GUI has no password and listens on all network interfaces. Never expose its port to the internet. To report a security problem, see [SECURITY.md](SECURITY.md).
+**Security:** the GUI has no password. By default it listens on this computer only. With `-lan` it listens on all network interfaces, so anyone on your network can use it and see your pictures: use `-lan` only on a network you trust, and never expose its port to the internet. To report a security problem, see [SECURITY.md](SECURITY.md).
 
 ## Testing and adding shapes
 

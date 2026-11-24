@@ -16,8 +16,24 @@ To stop it, close the small text window. It also stops by itself
 10 minutes after you close the last browser tab, unless it is still
 rendering or building.
 
-Your renders are saved in the "primitive" folder inside your Videos
-folder (Movies on a Mac).
+The first time you press Save, Export or Render, the program asks
+which folder to use. Tick "Always use this folder" to stop it asking.
+"Download to this device" sends the file to your browser instead.
+
+
+USE IT FROM A PHONE OR ANOTHER COMPUTER
+---------------------------------------
+
+At first only this computer can open the page. To use it from a phone
+or another computer at home, start it from a terminal with -lan:
+
+  Windows:      primitive-gui.exe -lan
+  Mac, Linux:   ./primitive-gui -lan
+
+The text window then shows the address to type on the other device.
+The page has no password: anyone on the same network can use it and
+see your pictures. Use -lan only at home or on another network you
+trust. If Windows asks about network access, say yes.
 
 
 THE FIRST TIME ONLY
@@ -27,9 +43,7 @@ The program is not signed with a paid certificate, so your computer
 warns you about it once.
 
 Windows: if a blue "Windows protected your PC" box appears, click
-"More info", then "Run anyway". If Windows asks about network access,
-you can say no; the program still works on this computer. Say yes only
-if you want to use it from your phone or another computer at home.
+"More info", then "Run anyway".
 
 Mac (Apple Silicon only): double-click "primitive-gui". When the Mac
 says it cannot check the program, click "Done". Open System Settings,

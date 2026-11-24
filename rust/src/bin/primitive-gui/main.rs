@@ -2,6 +2,8 @@
 //! server on the home network; one worker thread owns the GPU and the job.
 
 mod export;
+mod recipe;
+mod save;
 mod video;
 mod worker;
 
@@ -34,7 +36,8 @@ struct App {
     picture: watch::Receiver<Arc<Vec<u8>>>,
     original: watch::Receiver<Arc<Vec<u8>>>,
     tmp: PathBuf,
-    renders: PathBuf,
+    /// The folder of the current or last render (shared with the worker).
+    render_dir: Arc<Mutex<PathBuf>>,
     uploads: Arc<AtomicU64>,
     /// How many pages have their live connection open.
     pages: Arc<AtomicUsize>,
@@ -52,13 +55,15 @@ impl App {
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: primitive-gui [-port N] [-j N] [-no-open]
+        "Usage: primitive-gui [-port N] [-j N] [-no-open] [-lan]
 
   -port <n>   port to listen on (default 8640)
   -j <n>      CPU threads (default: all cores)
   -no-open    do not open the page in a browser
+  -lan        let other devices on the network (phone, laptop) use it;
+              without it, only this computer can open the page
 
-Open http://<this computer>:<port> in a browser."
+Open http://localhost:<port> in a browser."
     );
     std::process::exit(1)
 }
@@ -67,26 +72,29 @@ fn main() {
     let mut port: u16 = 8640;
     let mut threads: usize = 0;
     let mut open = true;
+    let mut lan = false;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
-        if args[i].trim_start_matches('-') == "no-open" {
-            open = false;
-            i += 1;
-            continue;
-        }
-        let next = |i: usize| args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
         match args[i].trim_start_matches('-') {
-            "port" => port = next(i) as u16,
-            "j" => threads = next(i),
-            _ => usage(),
+            "no-open" => open = false,
+            "lan" => lan = true,
+            _ => {
+                let next = |i: usize| args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
+                match args[i].trim_start_matches('-') {
+                    "port" => port = next(i) as u16,
+                    "j" => threads = next(i),
+                    _ => usage(),
+                }
+                i += 1;
+            }
         }
-        i += 2;
+        i += 1;
     }
     if threads > 0 {
         let _ = rayon::ThreadPoolBuilder::new().num_threads(threads).build_global();
     }
-    tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio").block_on(serve(port, open));
+    tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio").block_on(serve(port, open, lan));
 }
 
 /// Opens the page in the default browser, but only when someone sits at
@@ -120,9 +128,15 @@ fn lan_address() -> Option<std::net::IpAddr> {
     (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
 }
 
+/// The user's home folder. The file browser shows only this folder and the
+/// folders inside it.
+fn home_folder() -> PathBuf {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+}
+
 /// Where renders are saved: the user's Videos folder (Movies on a Mac).
 fn renders_folder() -> PathBuf {
-    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let home = home_folder();
     home.join(if cfg!(target_os = "macos") { "Movies" } else { "Videos" }).join("primitive")
 }
 
@@ -140,11 +154,13 @@ fn allow_helpers() {
     }
 }
 
-async fn serve(port: u16, open: bool) {
+/// `lan` false: listen on this computer only (127.0.0.1). True: listen on
+/// all interfaces, so other devices on the network can use the page.
+async fn serve(port: u16, open: bool, lan: bool) {
     #[cfg(target_os = "macos")]
     allow_helpers();
     let url = format!("http://localhost:{port}");
-    let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
+    let listener = match tokio::net::TcpListener::bind((if lan { "0.0.0.0" } else { "127.0.0.1" }, port)).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             eprintln!("Port {port} is in use: primitive-gui is probably already running. Open {url}");
@@ -167,6 +183,7 @@ async fn serve(port: u16, open: bool) {
     std::fs::create_dir_all(&tmp).expect("could not make the temp folder");
     let renders = renders_folder();
     let renders_text = renders.display().to_string();
+    let render_dir = Arc::new(Mutex::new(renders.clone()));
 
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (status_tx, status_rx) = watch::channel(String::from("{}"));
@@ -180,11 +197,11 @@ async fn serve(port: u16, open: bool) {
     }
     let busy = Arc::new(AtomicBool::new(false));
     let worker_done = {
-        let (tmp, renders, status_tx, busy) = (tmp.clone(), renders.clone(), status_tx.clone(), busy.clone());
+        let (tmp, renders, render_dir, status_tx, busy) = (tmp.clone(), renders.clone(), render_dir.clone(), status_tx.clone(), busy.clone());
         std::thread::spawn(move || {
             let st = status_tx.clone();
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                Worker::new(cmd_rx, tmp, renders, st, orig_tx, slot, busy).run();
+                Worker::new(cmd_rx, tmp, renders, render_dir, st, orig_tx, slot, busy).run();
             }));
             if let Err(e) = r {
                 let msg = e
@@ -207,7 +224,7 @@ async fn serve(port: u16, open: bool) {
         picture: pic_rx,
         original: orig_rx,
         tmp: tmp.clone(),
-        renders,
+        render_dir,
         uploads: Arc::new(AtomicU64::new(0)),
         pages: Arc::new(AtomicUsize::new(0)),
     };
@@ -219,17 +236,29 @@ async fn serve(port: u16, open: bool) {
         .route("/ws", get(ws))
         .route("/original", get(original))
         .route("/mask", get(key_mask))
+        .route("/recipe", get(get_recipe))
         .route("/defaults", get(|| async { ([(header::CONTENT_TYPE, "application/json")], serde_json::json!(Settings::default()).to_string()) }))
         .route("/export", get(export))
         .route("/download/{name}", get(download))
         .route("/sequence", post(sequence))
         .route("/zip/{name}", get(zip_download))
+        .route("/browse", get(browse))
+        .route("/open", post(open_file))
+        .route("/save", get(save_work))
+        .route("/save-open", post(save_open).layer(DefaultBodyLimit::disable()))
+        .route("/mkdir", post(make_folder))
+        .layer(axum::middleware::from_fn(same_site))
         .with_state(app.clone());
 
     println!("primitive-gui is running. Open one of these in a browser:");
     println!("  {url}");
-    if let Some(ip) = lan_address() {
-        println!("  http://{ip}:{port}   (phone or laptop)");
+    if lan {
+        if let Some(ip) = lan_address() {
+            println!("  http://{ip}:{port}   (phone or laptop)");
+        }
+        println!("WARNING: -lan is on. Any device on this network can use the page and see your pictures. It has no password.");
+    } else {
+        println!("Only this computer can open it. To use it from a phone or laptop, start it with -lan.");
     }
     println!("Renders are saved in {renders_text}");
     println!("To stop it, close this window or press Ctrl+C.");
@@ -335,20 +364,10 @@ async fn upload(State(app): State<App>, Query(q): Query<UploadQuery>, body: Body
         }
         None => app.tmp.join(format!("upload-{n}.{ext}")),
     };
-    let res: Result<(), String> = async {
-        let mut f = tokio::fs::File::create(&path).await.map_err(|e| e.to_string())?;
-        let mut stream = body.into_data_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| e.to_string())?;
-            f.write_all(&chunk).await.map_err(|e| e.to_string())?;
-        }
-        f.flush().await.map_err(|e| e.to_string())
-    }
-    .await;
-    match res {
+    match body_to_file(body, &path).await {
         Ok(()) => {
             if seq.is_none() {
-                app.send(Cmd::Load { path, name });
+                app.send(Cmd::Load { path, name, origin: None });
             }
             StatusCode::OK.into_response()
         }
@@ -357,6 +376,17 @@ async fn upload(State(app): State<App>, Query(q): Query<UploadQuery>, body: Body
             (StatusCode::INTERNAL_SERVER_ERROR, format!("upload failed: {e}")).into_response()
         }
     }
+}
+
+/// Writes a request body to the file `path`.
+async fn body_to_file(body: Body, path: &std::path::Path) -> Result<(), String> {
+    let mut f = tokio::fs::File::create(path).await.map_err(|e| e.to_string())?;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        f.write_all(&chunk).await.map_err(|e| e.to_string())?;
+    }
+    f.flush().await.map_err(|e| e.to_string())
 }
 
 #[derive(Deserialize)]
@@ -389,7 +419,7 @@ async fn zip_download(State(app): State<App>, UrlPath(name): UrlPath<String>) ->
     if !plain_name(&name) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let dir = app.renders.join(&name);
+    let dir = app.render_dir.lock().unwrap().join(&name);
     if !dir.is_dir() {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -422,6 +452,40 @@ async fn send_file(path: &std::path::Path, name: &str, mime: &str) -> Response {
 
 async fn ws(State(app): State<App>, upgrade: WebSocketUpgrade) -> Response {
     upgrade.on_upgrade(move |socket| live(app, socket))
+}
+
+/// True for a name a website on the internet cannot own: "localhost", an IP
+/// address, a name on the home network ("liams-pc" or "liams-pc.local").
+/// `host` may end in ":port", and an IPv6 address comes in brackets.
+fn local_host(host: &str) -> bool {
+    let h = host.trim().to_ascii_lowercase();
+    let h = match h.strip_prefix('[') {
+        Some(rest) => return rest.split(']').next().is_some_and(|ip| ip.parse::<std::net::Ipv6Addr>().is_ok()),
+        None => h.rsplit_once(':').map_or(h.as_str(), |(name, port)| if port.chars().all(|c| c.is_ascii_digit()) { name } else { "" }).to_string(),
+    };
+    !h.is_empty() && (h == "localhost" || h.ends_with(".localhost") || h.ends_with(".local") || !h.contains('.') || h.parse::<std::net::Ipv4Addr>().is_ok())
+}
+
+/// Turns away requests that come from a website instead of this page. A
+/// website open in the user's browser can send requests to this program,
+/// because the browser runs on this computer. Two checks stop it:
+/// - Host: the address the request was sent to. A website that points its
+///   own name at this computer ("DNS rebinding") fails it.
+/// - Origin: the page that sent the request. Browsers add it to the live
+///   connection and to posts from other websites, which the Host check
+///   alone would let through.
+async fn same_site(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let h = req.headers();
+    let host_ok = h.get(header::HOST).and_then(|v| v.to_str().ok()).is_some_and(local_host);
+    let origin_ok = match h.get(header::ORIGIN).map(|v| v.to_str().unwrap_or("")) {
+        None => true,
+        Some(o) => o.strip_prefix("http://").is_some_and(|rest| local_host(rest.split('/').next().unwrap_or(""))),
+    };
+    if host_ok && origin_ok {
+        next.run(req).await
+    } else {
+        (StatusCode::FORBIDDEN, "Open this page from its own address (for example http://localhost:8640).").into_response()
+    }
 }
 
 /// One page: commands in; status and the newest picture out. A slow page
@@ -497,7 +561,11 @@ fn parse_command(text: &str) -> Option<Cmd> {
         "key_del" => Cmd::KeyDelete { field: v["field"].as_str()?.to_string(), at: v["at"].as_u64()? as usize },
         "key_smooth" => Cmd::KeySmooth { field: v["field"].as_str()?.to_string(), on: v["on"].as_bool()? },
         "key_move" => Cmd::KeyMove { from: v["from"].as_u64()? as usize, to: v["to"].as_u64()? as usize },
-        "render" => Cmd::Render,
+        "recipe" if v["r"].is_object() => Cmd::Recipe(v["r"].clone()),
+        "render" => Cmd::Render(match v["dir"].as_str() {
+            Some(d) => Some(out_folder(d)?),
+            None => None,
+        }),
         "cancel" => Cmd::Cancel,
         "dismiss" => Cmd::DismissError,
         _ => return None,
@@ -516,6 +584,16 @@ async fn key_mask(State(app): State<App>) -> Response {
     ([(header::CONTENT_TYPE, "application/json")], serde_json::json!({ "w": w, "h": h, "bits": bits }).to_string()).into_response()
 }
 
+/// The recipe of the current work (see `recipe.rs`), for Save.
+async fn get_recipe(State(app): State<App>) -> Response {
+    let (tx, rx) = oneshot::channel();
+    app.send(Cmd::GetRecipe(tx));
+    match rx.await {
+        Ok(r) => ([(header::CONTENT_TYPE, "application/json"), (header::CACHE_CONTROL, "no-store")], serde_json::to_string_pretty(&r).unwrap_or_default()).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "the worker is not running").into_response(),
+    }
+}
+
 async fn original(State(app): State<App>) -> Response {
     let b = app.original.borrow().clone();
     if b.is_empty() {
@@ -526,6 +604,12 @@ async fn original(State(app): State<App>) -> Response {
 
 async fn export(State(app): State<App>, Query(q): Query<HashMap<String, String>>) -> Response {
     let fmt = q.get("fmt").cloned().unwrap_or_default();
+    // A folder picked by the user: check it before the work is done.
+    if let Some(d) = q.get("dir") {
+        if out_folder(d).is_none() {
+            return (StatusCode::BAD_REQUEST, FOLDER_GONE).into_response();
+        }
+    }
     let (tx, rx) = oneshot::channel();
     app.send(Cmd::Export(tx));
     let data = match rx.await {
@@ -535,6 +619,16 @@ async fn export(State(app): State<App>, Query(q): Query<HashMap<String, String>>
     };
     let tmp = app.tmp.clone();
     match tokio::task::spawn_blocking(move || export::export(&data, &fmt, &tmp)).await {
+        Ok(Ok((bytes, _, name))) if q.contains_key("dir") => {
+            let target = match place(&q["dir"], &name, q.get("replace").map(|s| s.as_str())) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            match tokio::fs::write(&target, bytes).await {
+                Ok(()) => saved_reply(&target),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Could not write {}: {e}", target.display())).into_response(),
+            }
+        }
         Ok(Ok((bytes, mime, name))) => (
             [
                 (header::CONTENT_TYPE, mime.to_string()),
@@ -557,5 +651,361 @@ async fn download(State(app): State<App>, UrlPath(name): UrlPath<String>) -> Res
         "gif" => "image/gif",
         _ => "video/mp4",
     };
-    send_file(&app.renders.join(&name), &name, mime).await
+    let path = app.render_dir.lock().unwrap().join(&name);
+    send_file(&path, &name, mime).await
+}
+
+// ------------------------------------------------------- output folders
+//
+// Save, Export and Render can write into a folder the user picked in the
+// file browser instead of sending the file to the browser. Like the file
+// browser, this only reaches folders inside the home folder.
+
+const FOLDER_GONE: &str = "That folder cannot be used (it may have been moved or deleted). Pick another one.";
+
+/// `dir` as an absolute path when it is a folder inside the home folder.
+fn out_folder(dir: &str) -> Option<PathBuf> {
+    let (_, p) = inside_home(std::path::Path::new(dir))?;
+    p.is_dir().then_some(p)
+}
+
+/// Where a file named `name` goes in the picked folder `dir`. When a file
+/// of that name is there, `replace` decides: "1" writes over it, "0" adds
+/// -2, -3 to the name, and no answer sends back 409 with `{exists}` so the
+/// page can ask the user.
+fn place(dir: &str, name: &str, replace: Option<&str>) -> Result<PathBuf, Response> {
+    let Some(dir) = out_folder(dir) else { return Err((StatusCode::BAD_REQUEST, FOLDER_GONE).into_response()) };
+    if !plain_name(name) {
+        return Err((StatusCode::BAD_REQUEST, format!("{name} is not a usable file name. Change File name in Export.")).into_response());
+    }
+    let p = dir.join(name);
+    if !p.exists() {
+        return Ok(p);
+    }
+    match replace {
+        Some("1") if p.is_file() => Ok(p),
+        Some("0") | Some("1") => {
+            let path = std::path::Path::new(name);
+            let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let ext = path.extension().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            Ok(export::unique(&dir, &stem, &ext))
+        }
+        _ => Err((StatusCode::CONFLICT, [(header::CONTENT_TYPE, "application/json")], serde_json::json!({ "exists": name }).to_string()).into_response()),
+    }
+}
+
+/// `path` the way the file browser shows it: Home/folder/file.
+fn shown_path(path: &std::path::Path) -> String {
+    let home = std::fs::canonicalize(home_folder()).unwrap_or_else(|_| home_folder());
+    match path.strip_prefix(&home) {
+        Ok(rest) => format!("Home/{}", rest.to_string_lossy().replace('\\', "/")),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+fn saved_reply(path: &std::path::Path) -> Response {
+    ([(header::CONTENT_TYPE, "application/json")], serde_json::json!({ "saved": shown_path(path) }).to_string()).into_response()
+}
+
+#[derive(Deserialize)]
+struct MkdirQuery {
+    dir: String,
+    name: String,
+}
+
+/// Makes a new folder inside a folder the file browser shows.
+async fn make_folder(Query(q): Query<MkdirQuery>) -> Response {
+    let name = q.name.trim().to_string();
+    let Some(dir) = out_folder(&q.dir) else { return (StatusCode::BAD_REQUEST, FOLDER_GONE).into_response() };
+    if !plain_name(&name) {
+        return (StatusCode::BAD_REQUEST, "A folder name cannot start with a dot or hold / \\ or :.").into_response();
+    }
+    let p = dir.join(&name);
+    match std::fs::create_dir(&p) {
+        Ok(()) => ([(header::CONTENT_TYPE, "application/json")], serde_json::json!({ "path": p }).to_string()).into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (StatusCode::CONFLICT, format!("{name} is already there.")).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Could not make the folder: {e}")).into_response(),
+    }
+}
+
+// ---------------------------------------------------------- file browser
+//
+// The page can list the home folder and the folders inside it, and open a
+// picture or video from there. It never moves or deletes a file; it only
+// writes new files and folders into picked folders (see output folders
+// above), and writes over a file only when the user said so. Every path from the page is made absolute with
+// `canonicalize` (which follows links and removes "..") and must then lie
+// inside the home folder. Hidden files and folders are not shown.
+
+const BROWSE_EXT: &[&str] = &[
+    "png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "tga", "heic", "heif", "avif", "qoi", "ppm", "pnm", "exr", "dpx", "gif", "mp4", "mov", "mkv",
+    "webm", "avi", "m4v", "mpg", "mpeg", "wmv", "flv", "ts", "mts", "m2ts", "ogv", "3gp", "primitive",
+];
+
+/// The home folder as an absolute path, and `path` as an absolute path if it
+/// lies inside it. None for anything outside the home folder.
+fn inside_home(path: &std::path::Path) -> Option<(PathBuf, PathBuf)> {
+    let home = std::fs::canonicalize(home_folder()).ok()?;
+    let p = std::fs::canonicalize(path).ok()?;
+    p.starts_with(&home).then_some((home, p))
+}
+
+fn browse_ext_ok(p: &std::path::Path) -> bool {
+    p.extension().is_some_and(|e| BROWSE_EXT.contains(&e.to_string_lossy().to_lowercase().as_str()))
+}
+
+/// Hidden: the name starts with a dot, or (Windows) the hidden mark is set.
+fn hidden(name: &str, meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & 0x2 != 0 {
+            return true;
+        }
+    }
+    let _ = meta;
+    name.starts_with('.')
+}
+
+#[derive(Deserialize)]
+struct BrowseQuery {
+    dir: Option<String>,
+}
+
+/// One folder's folders and pictures/videos as JSON. No `dir` means the
+/// home folder.
+async fn browse(Query(q): Query<BrowseQuery>) -> Response {
+    let r = tokio::task::spawn_blocking(move || -> Option<serde_json::Value> {
+        let asked = q.dir.map(PathBuf::from).unwrap_or_else(home_folder);
+        let (home, dir) = inside_home(&asked)?;
+        if !dir.is_dir() {
+            return None;
+        }
+        let (mut folders, mut files) = (Vec::new(), Vec::new());
+        for e in std::fs::read_dir(&dir).ok()?.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Ok(meta) = std::fs::metadata(e.path()) else { continue };
+            if hidden(&name, &meta) {
+                continue;
+            }
+            // A link that points outside the home folder is left out.
+            let Some((_, real)) = inside_home(&e.path()) else { continue };
+            if meta.is_dir() {
+                folders.push(serde_json::json!({ "name": name, "path": real }));
+            } else if meta.is_file() && browse_ext_ok(&real) {
+                files.push(serde_json::json!({ "name": name, "path": real, "size": meta.len() }));
+            }
+        }
+        let key = |v: &serde_json::Value| v["name"].as_str().unwrap_or("").to_lowercase();
+        folders.sort_by_key(key);
+        files.sort_by_key(key);
+        let up = (dir != home).then(|| dir.parent().map(|p| p.to_path_buf())).flatten();
+        let shown = match dir.strip_prefix(&home) {
+            Ok(rest) if rest.as_os_str().is_empty() => "Home".to_string(),
+            Ok(rest) => format!("Home/{}", rest.to_string_lossy().replace('\\', "/")),
+            Err(_) => return None,
+        };
+        Some(serde_json::json!({ "dir": dir, "shown": shown, "up": up, "folders": folders, "files": files }))
+    })
+    .await;
+    match r {
+        Ok(Some(v)) => ([(header::CONTENT_TYPE, "application/json"), (header::CACHE_CONTROL, "no-store")], v.to_string()).into_response(),
+        _ => (StatusCode::NOT_FOUND, "That folder cannot be shown.").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct OpenQuery {
+    path: String,
+    /// For a save file: see `SaveOpenQuery`.
+    source: Option<String>,
+    settings: Option<String>,
+}
+
+/// Opens a file the user picked in the file browser. The worker deletes its
+/// source file when it loads another one, so it never gets the user's file:
+/// it gets a hard link in the temp folder (deleting a link leaves the file),
+/// or a copy when a link cannot be made (another drive). A `.primitive`
+/// save file is only read.
+async fn open_file(State(app): State<App>, Query(q): Query<OpenQuery>) -> Response {
+    let n = app.uploads.fetch_add(1, Ordering::Relaxed);
+    let tmp = app.tmp.clone();
+    let asked = q.path.clone();
+    let r = tokio::task::spawn_blocking(move || -> Result<Result<(PathBuf, String, PathBuf), PathBuf>, (StatusCode, String)> {
+        let real = home_file(&asked).ok_or_else(|| (StatusCode::NOT_FOUND, "That file cannot be opened.".to_string()))?;
+        if is_save(&real) {
+            return Ok(Err(real));
+        }
+        let name = real.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let work = link_into_tmp(&real, &tmp, n).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Could not open {name}: {e}")))?;
+        Ok(Ok((work, name, real)))
+    })
+    .await;
+    match r {
+        Ok(Ok(Ok((path, name, real)))) => {
+            app.send(Cmd::Load { path, name, origin: Some(real) });
+            StatusCode::OK.into_response()
+        }
+        Ok(Ok(Err(save_file))) => open_save(app, save_file, q.source, q.settings.as_deref() == Some("1"), false).await,
+        Ok(Err(e)) => e.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// `path` as an absolute path, when it is a file inside the home folder
+/// that the file browser shows.
+fn home_file(path: &str) -> Option<PathBuf> {
+    let (_, real) = inside_home(std::path::Path::new(path))?;
+    (real.is_file() && browse_ext_ok(&real)).then_some(real)
+}
+
+fn is_save(p: &std::path::Path) -> bool {
+    p.extension().is_some_and(|e| e.eq_ignore_ascii_case("primitive"))
+}
+
+/// A hard link to `real` in the temp folder, or a copy when a link cannot
+/// be made. The worker may delete it; the user's file stays.
+fn link_into_tmp(real: &std::path::Path, tmp: &std::path::Path, n: u64) -> Result<PathBuf, String> {
+    let ext = real.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let work = tmp.join(format!("upload-{n}.{ext}"));
+    if std::fs::hard_link(real, &work).is_err() {
+        std::fs::copy(real, &work).map_err(|e| {
+            let _ = std::fs::remove_file(&work);
+            e.to_string()
+        })?;
+    }
+    Ok(work)
+}
+
+// ------------------------------------------------------------ save files
+//
+// See `save.rs`. Save gives a `.primitive` file to download. Opening one
+// loads its source: a file the user picked to replace a missing one, else
+// the file where it was at the save, else the picture inside the save
+// file. When none of these is there, the page is told the source is
+// missing and asks the user to find it.
+
+#[derive(Deserialize)]
+struct SaveQuery {
+    /// "1": put a copy of the still picture into the save file.
+    pic: Option<String>,
+    /// A folder picked by the user: the file is written there instead of
+    /// being sent to the browser. See `place` for `replace`.
+    dir: Option<String>,
+    replace: Option<String>,
+}
+
+async fn save_work(State(app): State<App>, Query(q): Query<SaveQuery>) -> Response {
+    if q.dir.as_deref().is_some_and(|d| out_folder(d).is_none()) {
+        return (StatusCode::BAD_REQUEST, FOLDER_GONE).into_response();
+    }
+    let (tx, rx) = oneshot::channel();
+    app.send(Cmd::GetSave(tx));
+    let Ok(data) = rx.await else { return (StatusCode::INTERNAL_SERVER_ERROR, "the worker is not running").into_response() };
+    let n = app.uploads.fetch_add(1, Ordering::Relaxed);
+    let out = app.tmp.join(format!("save-{n}.primitive"));
+    let stem = std::path::Path::new(&data.name).file_stem().map(|s| s.to_string_lossy().to_string()).filter(|s| !s.is_empty());
+    let name = format!("{}.primitive", stem.unwrap_or_else(|| "primitive-save".into()));
+    let target = match &q.dir {
+        Some(d) => match place(d, &name, q.replace.as_deref()) {
+            Ok(t) => Some(t),
+            Err(r) => return r,
+        },
+        None => None,
+    };
+    let include = q.pic.as_deref() == Some("1");
+    let o = out.clone();
+    match tokio::task::spawn_blocking(move || save::write(&data, include, &o)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Save failed: {e}")).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+    if let Some(target) = target {
+        let r = match tokio::fs::copy(&out, &target).await {
+            Ok(_) => saved_reply(&target),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Could not write {}: {e}", target.display())).into_response(),
+        };
+        let _ = tokio::fs::remove_file(&out).await;
+        return r;
+    }
+    let r = send_file(&out, &name, "application/zip").await;
+    // The open file stays readable on Linux and macOS while it is sent.
+    // On Windows the delete fails and the temp folder is cleared at exit.
+    let _ = tokio::fs::remove_file(&out).await;
+    r
+}
+
+#[derive(Deserialize)]
+struct SaveOpenQuery {
+    /// A file in the home folder picked by the user to use instead of the
+    /// saved source (it has moved).
+    source: Option<String>,
+    /// "1": use only the recipe (the user gave up on finding the source).
+    settings: Option<String>,
+}
+
+/// A save file uploaded from the page.
+async fn save_open(State(app): State<App>, Query(q): Query<SaveOpenQuery>, body: Body) -> Response {
+    let n = app.uploads.fetch_add(1, Ordering::Relaxed);
+    let path = app.tmp.join(format!("open-{n}.primitive"));
+    if let Err(e) = body_to_file(body, &path).await {
+        let _ = tokio::fs::remove_file(&path).await;
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("upload failed: {e}")).into_response();
+    }
+    open_save(app, path, q.source, q.settings.as_deref() == Some("1"), true).await
+}
+
+/// Opens the save file `file`. `settings_only`: use only its recipe.
+/// `uploaded`: it is a temp copy to delete.
+/// Answers JSON: `{ "ok": true }`, or `{ "missing": name, "kind": .. }`
+/// when the source has to be found, or `{ "ok": true, "settings_only":
+/// kind }` when the save has no source this program can open again.
+async fn open_save(app: App, file: PathBuf, source: Option<String>, settings_only: bool, uploaded: bool) -> Response {
+    let n = app.uploads.fetch_add(1, Ordering::Relaxed);
+    let tmp = app.tmp.clone();
+    let f = file.clone();
+    let r = tokio::task::spawn_blocking(move || -> Result<(serde_json::Value, Option<Cmd>), (StatusCode, String)> {
+        let bad = |e: String| (StatusCode::BAD_REQUEST, e);
+        let s = save::read(&f).map_err(bad)?;
+        if settings_only || !matches!(s.kind.as_str(), "image" | "video") {
+            let kind = s.kind.clone();
+            return Ok((serde_json::json!({ "ok": true, "settings_only": kind }), Some(Cmd::Recipe(s.recipe))));
+        }
+        // A picked file, else the saved place. Both must pass the same
+        // checks as the file browser: a save file could name any path.
+        let real = match &source {
+            Some(p) => Some(home_file(p).filter(|p| !is_save(p)).ok_or_else(|| bad("That file cannot be opened.".into()))?),
+            None => s.path.as_ref().and_then(|p| home_file(&p.to_string_lossy())).filter(|p| !is_save(p)),
+        };
+        let (work, name, origin) = match (real, &s.included) {
+            (Some(real), _) => {
+                let name = real.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                let work = link_into_tmp(&real, &tmp, n).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Could not open {name}: {e}")))?;
+                (work, name, Some(real))
+            }
+            (None, Some(inner)) => {
+                let ext = std::path::Path::new(inner).extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
+                let work = tmp.join(format!("upload-{n}.{ext}"));
+                save::extract(&f, inner, &work).map_err(bad)?;
+                (work, s.name.clone(), None)
+            }
+            (None, None) => return Ok((serde_json::json!({ "missing": s.name, "kind": s.kind }), None)),
+        };
+        let cmd = Cmd::LoadSave { path: work, name, origin, recipe: s.recipe, shapes: s.shapes };
+        Ok((serde_json::json!({ "ok": true }), Some(cmd)))
+    })
+    .await;
+    if uploaded {
+        let _ = tokio::fs::remove_file(&file).await;
+    }
+    match r {
+        Ok(Ok((answer, cmd))) => {
+            if let Some(cmd) = cmd {
+                app.send(cmd);
+            }
+            ([(header::CONTENT_TYPE, "application/json")], answer.to_string()).into_response()
+        }
+        Ok(Err(e)) => e.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }

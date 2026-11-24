@@ -200,9 +200,35 @@ code { background: #222; color: #ddd; padding: 0 3px; font-size: 11px; font-fami
 #ask::backdrop { background: #000a; }
 #ask p { margin: 0 0 16px; line-height: 1.5; }
 #ask label.radio { color: var(--label) !important; margin-bottom: 16px !important; }
+/* label.radio forces display: flex, which would show hidden rows. */
+#ask [hidden] { display: none !important; }
 #ask .ask-buttons { display: flex; justify-content: flex-end; gap: 8px; }
 #ask .ask-buttons button { min-width: 90px; min-height: 32px; }
 #ask-reset { width: 100%; margin-top: 10px; }
+
+/* File browser: folders and pictures in the home folder of the computer
+   the program runs on. */
+#browser { background: var(--panel-bg); color: var(--text); border: var(--border-w) solid var(--track-bg); border-radius: 0;
+           padding: 14px 16px; width: min(560px, 94vw); box-shadow: 0 10px 40px #000; }
+#browser::backdrop { background: #000a; }
+#browser-head { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
+#browser-where { color: var(--label); overflow-wrap: anywhere; }
+#browser-list { list-style: none; margin: 0 0 12px; padding: 0; height: min(420px, 60vh); overflow-y: auto;
+                border: var(--border-w) solid var(--track-bg); }
+#browser-list li { padding: 7px 10px; cursor: pointer; display: flex; gap: 10px; }
+#browser-list li:hover, #browser-list li:focus { background: var(--track-bg); outline: none; }
+#browser-list li.folder .n::after { content: "/"; color: var(--hint); }
+#browser-list li .s { margin-left: auto; color: var(--hint); white-space: nowrap; }
+#browser-list li.note { cursor: default; color: var(--hint); }
+#browser .ask-buttons { align-items: center; }
+#browser .grow { flex: 1; }
+#browser-mkdir-row { display: flex; gap: 8px; margin-bottom: 10px; }
+#browser-mkdir-row input { flex: 1; }
+#browser-list li.dim { cursor: default; color: var(--hint); }
+#browser-remember-row { margin-bottom: 12px !important; }
+#browser [hidden] { display: none !important; }
+#folders .folder-row { display: flex; gap: 6px; align-items: center; margin-top: 4px; }
+#folders .folder-row .where { flex: 1; overflow-wrap: anywhere; }
 
 /* Menu that opens on a right-click on a setting. */
 #field-menu { position: fixed; z-index: 60; min-width: 170px; padding: 4px; background: var(--panel-bg); outline: none;

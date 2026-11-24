@@ -6,7 +6,7 @@ use crate::raster::{crop_scanlines, fill_polygon, stroke_quadratic, Scanline, Sc
 use crate::rng::Rng;
 use tiny_skia::{FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Shape {
     Triangle { x1: i32, y1: i32, x2: i32, y2: i32, x3: i32, y3: i32 },
     Rectangle { x1: i32, y1: i32, x2: i32, y2: i32 },

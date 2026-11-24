@@ -10,12 +10,19 @@ const $ = (id) => document.getElementById(id);
 // answers yes by itself. "Show skipped warnings again" forgets them all.
 const SKIP = "primitive-skip-";
 function skipped() { return Object.keys(localStorage).filter((k) => k.startsWith(SKIP)); }
-function popup(text, { key = null, ok = "Go on", cancel = "Cancel" } = {}) {
+// `alt` adds a third button; then the answer is "yes", "alt" or "no".
+// `check` adds a tick box with that label; read $("ask-check").checked after.
+function popup(text, { key = null, ok = "Go on", cancel = "Cancel", alt = null, check = null } = {}) {
   const d = $("ask");
+  $("ask-check-row").hidden = !check;
+  $("ask-check-text").textContent = check || "";
+  $("ask-check").checked = false;
   $("ask-text").textContent = text;
   $("ask-yes").textContent = ok;
   $("ask-no").textContent = cancel;
   $("ask-no").hidden = !cancel;
+  $("ask-alt").textContent = alt || "";
+  $("ask-alt").hidden = !alt;
   $("ask-skip-row").hidden = !key;
   $("ask-skip").checked = false;
   d.returnValue = "";
@@ -25,7 +32,7 @@ function popup(text, { key = null, ok = "Go on", cancel = "Cancel" } = {}) {
     d.addEventListener("close", () => {
       const yes = d.returnValue === "yes";
       if (yes && key && $("ask-skip").checked) { localStorage.setItem(SKIP + key, "1"); showAskReset(); }
-      done(yes);
+      done(alt ? (d.returnValue || "no") : yes);
     }, { once: true });
   });
 }
@@ -201,16 +208,53 @@ for (const k of ALL) {
   $(k).addEventListener("change", sendSettings);
 }
 
-// Save the settings to a .json file, and load them back. A loaded file only
-// changes the settings it names, so files from older versions still work.
-$("settings-save").onclick = () => {
-  const data = { app: "primitive-gui", settings: readSettings() };
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = "primitive-settings.json";
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+// Save writes a .primitive save file (made by the program, see save.rs):
+// the recipe, where the source file is, and the shapes of a still picture.
+// Load opens a save file, or loads a recipe. The recipe holds the
+// settings, the keyframes and the painted areas, and no file names. A
+// loaded recipe only changes the settings it names, so files from older
+// versions still work. An older settings file has no "recipe" number and
+// changes only the settings.
+$("settings-save").onclick = async () => {
+  const kind = st ? st.kind : "none";
+  const name = st && st.name;
+  let text, check = null;
+  if (kind === "image") {
+    text = `Save your work on ${name}: the settings, the keyframes, the painted areas and the shapes made so far.`;
+    if (st.origin) {
+      text += " The save remembers where the picture is on this computer.";
+      check = "Include original picture (a bigger file, but it still works if the picture moves)";
+    } else {
+      text += " The picture was uploaded, so the program does not know where it is. A copy of it goes into the save.";
+    }
+  } else if (kind === "video" && st.video && st.video.sequence) {
+    text = "Save the settings and the painted area. Image sequences are not kept in a save file.";
+  } else if (kind === "video") {
+    text = `Save the settings and the painted area for ${name}. The shapes of a video are not kept: it builds again from the start when you open the save.`;
+    text += st.origin ? " The save remembers where the video is on this computer." : " The video was uploaded, so the save does not know where it is. You pick it again when you open the save.";
+  } else {
+    text = "Save the settings, the keyframes and the painted area. No file is open, so the save holds no picture.";
+  }
+  if (!(await popup(text, { ok: "Save", check }))) return;
+  const pic = check && $("ask-check").checked ? 1 : 0;
+  const dir = await folderFor("save");
+  if (!dir) return;
+  try {
+    showBusy("Saving", 0);
+    if (dir !== "download") {
+      const where = await writeInto(`/save?pic=${pic}`, dir);
+      if (where) savedNote(`Saved ${where}`);
+      return;
+    }
+    const r = await fetch(`/save?pic=${pic}`);
+    if (!r.ok) throw new Error(await r.text());
+    const m = /filename="([^"]+)"/.exec(r.headers.get("Content-Disposition") || "");
+    saveBlob(await r.blob(), m ? m[1] : "primitive-save.primitive");
+  } catch (e) {
+    tell(`Save failed: ${e.message}`);
+  } finally {
+    hideBusy();
+  }
 };
 $("settings-load").onclick = () => $("settings-file").click();
 $("settings-file").addEventListener("change", async () => {
@@ -218,16 +262,137 @@ $("settings-file").addEventListener("change", async () => {
   $("settings-file").value = "";
   if (!f) return;
   if (st && st.render) { tell("A render is running. Cancel it first."); return; }
-  let loaded;
+  if (SAVE_FILE.test(f.name)) return openSave(f);
+  let data;
+  if (/\.(png|svg)$/i.test(f.name)) {
+    data = await recipeIn(f);
+    if (!data) { tell(`${f.name} has no recipe in it. Only PNG and SVG files exported by this program hold one, and websites and chat apps often remove it.`); return; }
+    return loadRecipe(data, f.name);
+  }
   try {
-    const data = JSON.parse(await f.text());
-    loaded = data && typeof data.settings === "object" ? data.settings : data;
+    data = JSON.parse(await f.text());
   } catch (e) {
-    tell(`${f.name} is not a settings file.`);
+    tell(`${f.name} is not a recipe or settings file.`);
     return;
   }
-  if ((await applySettings(loaded)) === "none") tell(`${f.name} has no settings in it.`);
+  if (!data || typeof data !== "object") { tell(`${f.name} is not a recipe or settings file.`); return; }
+  // The oldest settings files hold the settings with nothing around them.
+  if (typeof data.settings !== "object") data = { settings: data };
+  await loadRecipe(data, f.name);
 });
+
+// The recipe inside a PNG or SVG exported by this program, or null. The
+// program writes it as a PNG text chunk (iTXt) or an SVG <metadata>
+// element named "primitive-recipe" (see `recipe.rs`).
+const RECIPE_TAG = "primitive-recipe";
+async function recipeIn(file) {
+  const parse = (text) => {
+    try {
+      const r = JSON.parse(text);
+      return r && typeof r === "object" && typeof r.recipe === "number" && typeof r.settings === "object" ? r : null;
+    } catch (e) { return null; }
+  };
+  try {
+    if (/\.svg$/i.test(file.name) || file.type === "image/svg+xml") {
+      if (file.size > 64e6) return null;
+      const doc = new DOMParser().parseFromString(await file.text(), "image/svg+xml");
+      const el = doc.getElementById(RECIPE_TAG);
+      return el ? parse(el.textContent) : null;
+    }
+    if (!(/\.png$/i.test(file.name) || file.type === "image/png") || file.size > 256e6) return null;
+    const b = new Uint8Array(await file.arrayBuffer());
+    const dv = new DataView(b.buffer);
+    const sig = [137, 80, 78, 71, 13, 10, 26, 10];
+    if (b.length < 8 || sig.some((v, i) => b[i] !== v)) return null;
+    const latin = (a) => String.fromCharCode(...a);
+    for (let at = 8; at + 12 <= b.length;) {
+      const len = dv.getUint32(at);
+      const type = latin(b.subarray(at + 4, at + 8));
+      const data = b.subarray(at + 8, Math.min(at + 8 + len, b.length));
+      if (type === "IDAT" || type === "IEND") break;   // text chunks we write come first
+      if (type === "iTXt") {
+        const z = data.indexOf(0);
+        if (z > 0 && latin(data.subarray(0, z)) === RECIPE_TAG) {
+          const compressed = data[z + 1] === 1;
+          let p = z + 3;
+          p = data.indexOf(0, p) + 1;      // language
+          p = data.indexOf(0, p) + 1;      // translated keyword
+          if (p <= 0) return null;
+          let text = data.subarray(p);
+          if (compressed) text = new Uint8Array(await new Response(new Blob([text]).stream().pipeThrough(new DecompressionStream("deflate"))).arrayBuffer());
+          return parse(new TextDecoder().decode(text));
+        }
+      }
+      at += 12 + len;
+    }
+  } catch (e) {}
+  return null;
+}
+
+// ------------------------------------------------------------ save files
+// A save file is a File from this device, or the path of one in the file
+// browser. Opening it can tell us its source has moved: then the user
+// finds the source in the file browser, or uses only the settings.
+const SAVE_FILE = /\.primitive$/i;
+async function openSave(save, { source = null, settings = false, asked = false } = {}) {
+  if (st && st.render) { tell("A render is running. Cancel it first."); return; }
+  if (!asked && st && st.has_work && !(await ask("open-save", "Opening this save file replaces the work on screen. Go on?"))) return;
+  const isPath = typeof save === "string";
+  const label = isPath ? save.split(/[\\/]/).pop() : save.name;
+  let q = source ? "source=" + encodeURIComponent(source) : "";
+  if (settings) q += (q ? "&" : "") + "settings=1";
+  let status, body;
+  showBusy(`Opening ${label}`, 0);
+  try {
+    if (isPath) {
+      const r = await fetch("/open?path=" + encodeURIComponent(save) + (q ? "&" + q : ""), { method: "POST" });
+      [status, body] = [r.status, await r.text()];
+    } else {
+      [status, body] = await new Promise((done) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", "/save-open" + (q ? "?" + q : ""));
+        xhr.upload.onprogress = (e) => { if (e.lengthComputable) showBusy(`Opening ${label}`, e.loaded / e.total); };
+        xhr.onload = () => done([xhr.status, xhr.responseText]);
+        xhr.onerror = () => done([0, "Could not send the file."]);
+        xhr.send(save);
+      });
+    }
+  } finally {
+    hideBusy();
+  }
+  if (status !== 200) { tell(body || `Could not open ${label}.`); return; }
+  let d = {};
+  try { d = JSON.parse(body); } catch (e) {}
+  lastEdit = 0;
+  if (d.missing != null) {
+    const what = d.kind === "video" ? "video" : "picture";
+    const pick = await popup(`The ${what} ${d.missing} is not where it was when you saved, or it was uploaded. Find it on this computer, or use only the settings of the save?`,
+      { ok: "Find it", alt: "Use only the settings" });
+    if (pick === "yes") openBrowser({ save, name: d.missing });
+    else if (pick === "alt") openSave(save, { settings: true, asked: true });
+  } else if (d.settings_only === "sequence") {
+    tell("This save was made on an image sequence. Image sequences are not kept in a save file, so only the settings were loaded.");
+  }
+}
+
+// Sends a recipe (or older settings file) to the program, after asking
+// about the work it would throw away.
+async function loadRecipe(data, name) {
+  const isRecipe = typeof data.recipe === "number";
+  const cur = readSettings();
+  const s = data.settings || {};
+  const known = Object.keys(cur).filter((k) => k in s && typeof s[k] === typeof cur[k]);
+  if (!known.length && !isRecipe) { tell(`${name} has no settings in it.`); return; }
+  const hasKeys = isRecipe && data.keys && Object.keys(data.keys).length > 0;
+  const image = st && st.kind === "image";
+  if (isRecipe && image && st.has_work &&
+      !(await ask("recipe-restart", "Loading this recipe starts the picture again and throws away its shapes. Go on?"))) return;
+  if (st && st.kind === "video" && "build_on" in s && s.build_on !== cur.build_on && st.has_work &&
+      !(await ask("switch-frames", "These settings switch how video frames are built. That clears the shapes of every frame. Go on?"))) return;
+  lastEdit = 0;
+  send({ t: "recipe", r: data });
+  if (hasKeys && !image) tell("This recipe has keyframes. Keyframes work only on a still picture, so they were left out. Open a still picture and load the recipe again to use them.");
+}
 
 // Puts loaded settings into the panel and sends them. A setting that is
 // missing, or of the wrong type, keeps its current value. Gives "none" when
@@ -290,6 +455,23 @@ for (const r of document.querySelectorAll("input[name=frames]")) {
 async function upload(file) {
   if (!file) return;
   if (st && st.render) { tell("A render is running. Cancel it first."); return; }
+  if (SAVE_FILE.test(file.name)) return openSave(file);
+  // A PNG or SVG exported by this program holds the recipe it was made with.
+  // Opening it asks whether to use that recipe too. (Load in the panel
+  // puts a recipe on the current picture without opening the file.)
+  const recipe = await recipeIn(file);
+  let withRecipe = false;
+  if (recipe) {
+    if (/\.svg$/i.test(file.name) || file.type === "image/svg+xml") {
+      // The program cannot open an SVG as a picture, so only the recipe is offered.
+      if (await popup(`${file.name} holds the recipe it was made with (settings, keyframes and painted area). An SVG cannot be opened as a picture. Use its recipe on the current picture?`, { ok: "Use the recipe" })) loadRecipe(recipe, file.name);
+      return;
+    }
+    const pick = await popup(`${file.name} holds the recipe it was made with (settings, keyframes and painted area). Open the picture with its recipe, or without it?`,
+      { ok: "Open with recipe", alt: "Open without recipe" });
+    if (pick === "no") return;
+    withRecipe = pick === "yes";
+  }
   if (st && st.has_work && st.kind === "video" && !(await ask("load-file", "Loading a new file throws away the work on this video. Go on?"))) return;
   const xhr = new XMLHttpRequest();
   xhr.open("POST", "/upload?name=" + encodeURIComponent(file.name));
@@ -298,7 +480,9 @@ async function upload(file) {
   };
   xhr.onload = () => {
     hideBusy();
-    if (xhr.status !== 200) { localError = xhr.responseText || "Upload failed."; render(); }
+    if (xhr.status !== 200) { localError = xhr.responseText || "Upload failed."; render(); return; }
+    // The program loads the picture before it answers, so the recipe lands on the new picture.
+    if (withRecipe) { lastEdit = 0; send({ t: "recipe", r: recipe }); }
   };
   xhr.onerror = () => { hideBusy(); localError = "Upload failed."; render(); };
   showBusy(`Uploading ${file.name}`, 0);
@@ -313,6 +497,214 @@ function showBusy(text, p) {
   $("busy-bar").style.width = `${Math.round((p || 0) * 100)}%`;
 }
 function hideBusy() { uploading = false; render(); }
+
+// ---------------------------------------------------------- file browser
+// Lists the home folder of the computer the program runs on (see `browse`
+// in main.rs). Opening a file from here lets the program know where the
+// file really is; an upload only gives it a copy.
+let browseDir = localStorage.getItem("browse-dir") || "";
+let browseShown = "";
+async function showFolder(dir) {
+  const list = $("browser-list");
+  let r = await fetch("/browse" + (dir ? "?dir=" + encodeURIComponent(dir) : ""));
+  if (!r.ok && dir) { dir = ""; r = await fetch("/browse"); }   // the folder is gone: go home
+  list.textContent = "";
+  if (!r.ok) { $("browser-where").textContent = "The folders cannot be shown."; return; }
+  const d = await r.json();
+  browseDir = d.dir;
+  browseShown = d.shown;
+  localStorage.setItem("browse-dir", d.dir);
+  $("browser-where").textContent = d.shown;
+  $("browser-up").disabled = !d.up;
+  $("browser-up").onclick = () => showFolder(d.up);
+  const row = (cls, name, size, act) => {
+    const li = document.createElement("li");
+    li.className = cls;
+    li.tabIndex = 0;
+    const n = document.createElement("span");
+    n.className = "n";
+    n.textContent = name;
+    li.append(n);
+    if (size != null) {
+      const s = document.createElement("span");
+      s.className = "s";
+      s.textContent = size < 1e6 ? `${Math.max(1, Math.round(size / 1e3))} KB` : `${(size / 1e6).toFixed(1)} MB`;
+      li.append(s);
+    }
+    li.onclick = act;
+    li.onkeydown = (e) => { if (e.key === "Enter") act(); };
+    list.append(li);
+  };
+  for (const f of d.folders) row("folder", f.name, null, () => showFolder(f.path));
+  for (const f of d.files) {
+    if (finding && SAVE_FILE.test(f.name)) continue;
+    // Picking a folder: the files are shown so the user sees what is there.
+    if (picking) row("file dim", f.name, f.size, () => {});
+    else row("file", f.name, f.size, () => openPath(f.path, f.name));
+  }
+  if (!d.folders.length && !d.files.length) row("note", "No pictures, videos or folders here.", null, () => {});
+  list.scrollTop = 0;
+}
+// `find`: { save, name } when the user looks for the moved source of a
+// save file. Picking a file then opens the save with that file.
+let finding = null;
+function openBrowser(find = null) {
+  finding = find;
+  browserMode(false);
+  $("browser-find").hidden = !find;
+  $("browser-find").textContent = find ? `Find ${find.name}, then click it.` : "";
+  $("browser-upload").hidden = !!find;
+  $("browser").showModal();
+  showFolder(browseDir);
+}
+// Shows the buttons for opening a file, or for picking a folder.
+function browserMode(pick) {
+  for (const id of ["browser-download", "browser-here", "browser-mkdir", "browser-remember-row"]) $(id).hidden = !pick;
+  $("browser-mkdir-row").hidden = true;
+  $("browser-upload").hidden = pick;
+  $("browser-close").className = pick ? "" : "primary";
+}
+$("browser").addEventListener("close", () => {
+  setTimeout(() => { finding = null; }, 0);
+  if (picking) { const p = picking; picking = null; p.done(null); }   // Esc or Cancel
+});
+$("browser-close").onclick = () => $("browser").close();
+$("browser-upload").onclick = () => { $("browser").close(); $("file").click(); };
+
+// ------------------------------------------------------- output folders
+// Save, Export and Render each write into their own folder on the computer
+// the program runs on. With no folder set, each one opens the file browser
+// to pick a folder; "Always use this folder" makes it the set folder for
+// that button. "Download to this device" sends the file to the browser
+// instead, for a phone or laptop. Set folders are kept in this browser.
+const FOLDER_WORDS = { save: "saves", export: "exports", render: "renders" };
+const HERE_WORDS = { save: "Save here", export: "Export here", render: "Render here" };
+let picking = null;          // { kind, done } while the file browser picks a folder
+function setFolder(kind) {
+  try { return JSON.parse(localStorage.getItem("folder-" + kind) || "null"); } catch { return null; }
+}
+// Resolves to { path, shown }, "download", or null when the user cancelled.
+function pickFolder(kind, remember = false) {
+  return new Promise((done) => {
+    finding = null;
+    picking = { kind, done };
+    browserMode(true);
+    $("browser-find").hidden = false;
+    $("browser-find").textContent = `Pick the folder for ${FOLDER_WORDS[kind]}: open it, then press ${HERE_WORDS[kind]}.`;
+    $("browser-here").textContent = HERE_WORDS[kind];
+    $("browser-remember").checked = remember;
+    $("browser-remember-text").textContent = `Always use this folder for ${FOLDER_WORDS[kind]}`;
+    $("browser").showModal();
+    showFolder(browseDir);
+  });
+}
+function endPick(result) {
+  const p = picking;
+  picking = null;
+  $("browser").close();
+  if (p) p.done(result);
+}
+$("browser-here").onclick = () => {
+  if (!picking) return;
+  const f = { path: browseDir, shown: browseShown };
+  if ($("browser-remember").checked) { localStorage.setItem("folder-" + picking.kind, JSON.stringify(f)); showFolders(); }
+  endPick(f);
+};
+$("browser-download").onclick = () => endPick("download");
+$("browser-mkdir").onclick = () => {
+  $("browser-mkdir-row").hidden = !$("browser-mkdir-row").hidden;
+  if (!$("browser-mkdir-row").hidden) { $("browser-mkdir-name").value = ""; $("browser-mkdir-name").focus(); }
+};
+async function makeFolder() {
+  const name = $("browser-mkdir-name").value.trim();
+  if (!name) return;
+  const r = await fetch(`/mkdir?dir=${encodeURIComponent(browseDir)}&name=${encodeURIComponent(name)}`, { method: "POST" });
+  if (!r.ok) { tell(await r.text()); return; }
+  $("browser-mkdir-row").hidden = true;
+  showFolder((await r.json()).path);
+}
+$("browser-mkdir-ok").onclick = makeFolder;
+$("browser-mkdir-name").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); makeFolder(); }
+  if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); $("browser-mkdir-row").hidden = true; }
+});
+// The set folder of Save, Export or Render, checked that it is still
+// there; else the user picks one.
+async function folderFor(kind) {
+  const f = setFolder(kind);
+  if (f) {
+    const r = await fetch("/browse?dir=" + encodeURIComponent(f.path));
+    if (r.ok) return f;
+    localStorage.removeItem("folder-" + kind);
+    showFolders();
+    await tell(`The folder for ${FOLDER_WORDS[kind]}, ${f.shown}, is not there any more. Pick another one.`);
+  }
+  return pickFolder(kind);
+}
+// Asks the program to write a file into a picked folder. When a file of
+// that name is there, the user picks Overwrite, Save as new or Cancel.
+// Gives where it was saved, or null when the user cancelled.
+async function writeInto(url, dir) {
+  let replace = "";
+  for (;;) {
+    const r = await fetch(`${url}&dir=${encodeURIComponent(dir.path)}${replace}`);
+    if (r.status === 409) {
+      const { exists } = await r.json();
+      hideBusy();
+      const pick = await popup(`${exists} is already in ${dir.shown}. Write over it, or save the new file next to it with a number added?`,
+        { ok: "Save as new", alt: "Overwrite" });
+      if (pick === "no") return null;
+      replace = pick === "alt" ? "&replace=1" : "&replace=0";
+      continue;
+    }
+    if (!r.ok) throw new Error(await r.text());
+    return (await r.json()).saved;
+  }
+}
+let noteTimer = 0;
+function savedNote(text) {
+  $("saved-note").textContent = text;
+  clearTimeout(noteTimer);
+  noteTimer = setTimeout(() => { $("saved-note").textContent = ""; }, 10000);
+}
+// The Folders list in the Export section.
+function showFolders() {
+  const box = $("folders");
+  box.textContent = "";
+  for (const kind of ["save", "export", "render"]) {
+    const f = setFolder(kind);
+    const row = document.createElement("div");
+    row.className = "folder-row";
+    const where = document.createElement("span");
+    where.className = "where hint";
+    where.textContent = `${FOLDER_WORDS[kind][0].toUpperCase()}${FOLDER_WORDS[kind].slice(1)}: ${f ? f.shown : "ask each time"}`;
+    const change = document.createElement("button");
+    change.textContent = f ? "Change" : "Set";
+    change.title = `Pick the folder that ${FOLDER_WORDS[kind]} always go to`;
+    change.onclick = async () => { await pickFolder(kind, true); showFolders(); };
+    row.append(where, change);
+    if (f) {
+      const forget = document.createElement("button");
+      forget.textContent = "Ask";
+      forget.title = `Forget this folder: ${FOLDER_WORDS[kind]} ask for a folder each time`;
+      forget.onclick = () => { localStorage.removeItem("folder-" + kind); showFolders(); };
+      row.append(forget);
+    }
+    box.append(row);
+  }
+}
+showFolders();
+async function openPath(path, name) {
+  const find = finding;
+  $("browser").close();
+  if (find) return openSave(find.save, { source: path, asked: true });
+  if (SAVE_FILE.test(name)) return openSave(path);
+  if (st && st.has_work && st.kind === "video" && !(await ask("load-file", "Loading a new file throws away the work on this video. Go on?"))) return;
+  showBusy(`Opening ${name}`, 0);
+  const r = await fetch("/open?path=" + encodeURIComponent(path), { method: "POST" });
+  hideBusy();
+  if (!r.ok) { localError = (await r.text()) || `Could not open ${name}.`; render(); }
+}
 
 // Image sequences: several pictures, or a folder of them.
 const PICTURE = /\.(png|jpe?g|webp|bmp|tiff?|tga|heic|heif|avif|qoi|ppm|pnm|exr|dpx)$/i;
@@ -386,9 +778,10 @@ async function readEntry(entry, out) {
   }
 }
 
+$("pick-browse").onclick = () => openBrowser();
 $("pick").onclick = () => $("file").click();
 $("pick-folder").onclick = () => $("folder").click();
-$("open").onclick = () => $("file").click();
+$("open").onclick = () => openBrowser();
 const fromInput = (input) => Array.from(input.files, (file) => ({ file, path: file.webkitRelativePath || file.name }));
 $("file").onchange = () => { uploadMany(fromInput($("file"))); $("file").value = ""; };
 $("folder").onchange = () => { uploadMany(fromInput($("folder"))); $("folder").value = ""; };
@@ -427,12 +820,28 @@ let exporting = false; // a single-image export is downloading
 $("render").onclick = async () => {
   if (!st) return;
   if (st.render) { send({ t: "cancel" }); myRender = false; return; }
-  if (st.kind === "video") { myRender = true; send({ t: "render" }); return; }
+  if (st.kind === "video") {
+    const dir = await folderFor("render");
+    if (!dir) return;
+    // Download: render into the default folder and download it at the end.
+    myRender = dir === "download";
+    send(myRender ? { t: "render" } : { t: "render", dir: dir.path });
+    return;
+  }
   const fmt = $("export_fmt").value;
+  const dir = await folderFor("export");
+  if (!dir) return;
   exporting = true;
   $("render").disabled = true;
   $("render").textContent = ["mp4", "webm", "gif"].includes(fmt) ? "Making video…" : "Exporting…";
   try {
+    if (dir !== "download") {
+      const where = await writeInto(`/export?fmt=${fmt}`, dir);
+      if (where) savedNote(`Exported ${where}`);
+      exporting = false;
+      render();
+      return;
+    }
     const r = await fetch(`/export?fmt=${fmt}`);
     if (!r.ok) throw new Error(await r.text());
     const blob = await r.blob();
@@ -452,9 +861,18 @@ $("save-frame").onclick = async () => {
   if (!st || st.kind !== "video" || savingFrame) return;
   const seq = $("export_fmt").value;
   const fmt = seq === "jpg-seq" ? "jpg" : seq === "svg-seq" ? "svg" : "png";
+  const dir = await folderFor("export");
+  if (!dir) return;
   savingFrame = true;
   render();
   try {
+    if (dir !== "download") {
+      const where = await writeInto(`/export?fmt=${fmt}`, dir);
+      if (where) savedNote(`Saved ${where}`);
+      savingFrame = false;
+      render();
+      return;
+    }
     const r = await fetch(`/export?fmt=${fmt}`);
     if (!r.ok) throw new Error(await r.text());
     const blob = await r.blob();

@@ -17,7 +17,7 @@
       <div id="overlay"><canvas id="mask-canvas"></canvas><div id="spot-dot"></div></div>
       <div id="drop-hint">
         <div class="big">Drop an image, a video, or a folder of pictures here</div>
-        <div>or <button id="pick">choose files</button> <button id="pick-folder">choose a folder</button></div>
+        <div>or <button id="pick-browse">browse the computer</button> <button id="pick">upload files</button> <button id="pick-folder">upload a folder</button></div>
         <div class="small">Pick several pictures to load them as an image sequence.</div>
       </div>
       <div id="slots" hidden></div>
@@ -31,14 +31,14 @@
       <button id="save-frame" hidden title="Save the frame on screen as one picture, at the output size. It is a JPG or SVG when File type is that kind of image sequence, and a PNG otherwise.">Save frame</button>
       <button id="snapshot" disabled title="Keep the picture on screen, its settings and the painted area in a slot at the top left. Press 1 to 8 to view a slot.">Snapshot</button>
       <button id="hold-original" disabled title="Hold to see the original picture">Original</button>
-      <button id="open" title="Load another file">Open…</button>
+      <button id="open" title="Load another file: browse the computer the program runs on, or upload from this device">Open…</button>
     </div>
     <div id="timeline-row" hidden>
       <canvas id="timeline" height="34"></canvas>
       <span id="time"></span>
     </div>
     <div id="render-row" hidden></div>
-    <input type="file" id="file" accept="image/*,video/*,.gif,.heic" multiple hidden>
+    <input type="file" id="file" accept="image/*,video/*,.gif,.heic,.primitive" multiple hidden>
     <input type="file" id="folder" webkitdirectory hidden>
   </main>
 
@@ -46,10 +46,10 @@
     <div id="panel-grip" title="Drag to change the panel width. Double-click to reset."></div>
     <div id="panel-head"><strong>PRIMITIVE</strong>
       <span class="head-buttons">
-        <button id="settings-save" title="Save these settings to a file">Save</button>
-        <button id="settings-load" title="Load settings from a saved file">Load</button>
+        <button id="settings-save" title="Save your work as a .primitive file: the settings, the keyframes, the painted areas, the shapes made so far on a still picture, and where the source file is on this computer. To share a recipe, export a PNG or SVG: it holds the recipe and no folder names.">Save</button>
+        <button id="settings-load" title="Open a .primitive save file to go on with that work. Also loads a recipe file, an older settings file, or a PNG or SVG exported by this program (it holds its recipe). A recipe on a still picture starts the picture again.">Load</button>
       </span>
-      <input type="file" id="settings-file" accept=".json,application/json" hidden>
+      <input type="file" id="settings-file" accept=".primitive,.json,application/json,.png,.svg" hidden>
     </div>
     <div id="panel-body">
     <details class="sec" open>
@@ -195,6 +195,7 @@
         <label>First frame <input type="number" id="frame_start" min="0"></label>
       </div>
       <div class="hint" id="name-example"></div>
+      <div id="folders" title="Where Save, Export and Render write their files on the computer the program runs on. With no folder set, each one asks for a folder when you press it."></div>
     </details>
     </div>
 
@@ -204,6 +205,7 @@
         <button id="render" class="primary" disabled>Render</button>
       </div>
       <div id="render-link"></div>
+      <div id="saved-note" class="hint"></div>
     </div>
   </aside>
 </div>
@@ -212,12 +214,29 @@
 <dialog id="ask">
   <form method="dialog">
     <p id="ask-text"></p>
+    <label id="ask-check-row" class="radio" hidden><input type="checkbox" id="ask-check"> <span id="ask-check-text"></span></label>
     <label id="ask-skip-row" class="radio"><input type="checkbox" id="ask-skip"> Don't ask again</label>
     <div class="ask-buttons">
       <button value="no" id="ask-no">Cancel</button>
+      <button value="alt" id="ask-alt" hidden></button>
       <button value="yes" id="ask-yes" class="primary">Go on</button>
     </div>
   </form>
+</dialog>
+<dialog id="browser">
+  <div id="browser-head"><button id="browser-up" title="Go to the folder above">Up</button><span id="browser-where"></span>
+    <span class="grow"></span><button id="browser-mkdir" hidden title="Make a new folder inside this one">New folder</button></div>
+  <div id="browser-mkdir-row" hidden><input type="text" id="browser-mkdir-name" placeholder="Name of the new folder" spellcheck="false"><button id="browser-mkdir-ok">Make</button></div>
+  <div id="browser-find" class="small" hidden></div>
+  <ul id="browser-list"></ul>
+  <label id="browser-remember-row" class="radio" hidden><input type="checkbox" id="browser-remember"> <span id="browser-remember-text"></span></label>
+  <div class="ask-buttons">
+    <button id="browser-upload" title="Pick files on the device you are using now and send them to the program">Upload from this device…</button>
+    <button id="browser-download" hidden title="Send the file to the device you are using now, as a browser download, instead of saving it on the computer the program runs on">Download to this device</button>
+    <span class="grow"></span>
+    <button id="browser-close" class="primary">Cancel</button>
+    <button id="browser-here" class="primary" hidden>Save here</button>
+  </div>
 </dialog>
 <script src="app.js"></script>
 </body>

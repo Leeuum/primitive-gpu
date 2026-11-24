@@ -2,6 +2,7 @@
 //! file names from the user's pattern, the background writer for image
 //! sequences, and zipping a finished sequence folder.
 
+use crate::recipe;
 use crate::video;
 use crate::worker::{jpeg, ExportData};
 use primitive_gpu::load;
@@ -155,13 +156,19 @@ pub fn export(d: &ExportData, fmt: &str, tmp: &Path) -> Result<(Vec<u8>, &'stati
         pm
     };
     match fmt {
-        "png" => Ok((png_bytes(&load::pixmap_to_rgba(&full()))?, "image/png", name("png"))),
+        "png" => {
+            let png = png_bytes(&load::pixmap_to_rgba(&full()))?;
+            Ok((recipe::into_png(png, &d.recipe), "image/png", name("png")))
+        }
         "jpg" => {
             let mut img = load::pixmap_to_rgba(&full());
             flatten(&mut img, d.bg);
             Ok((jpeg(&img, 95), "image/jpeg", name("jpg")))
         }
-        "svg" => Ok((model::svg_of(sw, sh, scale, d.bg, &d.shapes, &d.colors).into_bytes(), "image/svg+xml", name("svg"))),
+        "svg" => {
+            let svg = model::svg_of(sw, sh, scale, d.bg, &d.shapes, &d.colors);
+            Ok((recipe::into_svg(svg, &d.recipe).into_bytes(), "image/svg+xml", name("svg")))
+        }
         "mp4" | "webm" | "gif" => {
             let mime = match fmt {
                 "mp4" => "video/mp4",

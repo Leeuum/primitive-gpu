@@ -2,6 +2,7 @@
 //! job state. The web server sends it commands and shows what it publishes.
 
 use crate::export::{self, FileWriter, Naming, Payload};
+use crate::recipe;
 use crate::video::{self, VideoInfo};
 use image::codecs::jpeg::JpegEncoder;
 use primitive_gpu::core::Metric;
@@ -362,15 +363,60 @@ pub enum Cmd {
     /// Move every key at shape `from` to shape `to`.
     KeyMove { from: usize, to: usize },
     GetMask(oneshot::Sender<Option<MaskData>>),
-    Render,
+    /// The recipe (settings, keyframes, painted areas), see `recipe.rs`.
+    GetRecipe(oneshot::Sender<serde_json::Value>),
+    /// Use a recipe, or the settings of an older settings file.
+    Recipe(serde_json::Value),
+    /// Render the video. The folder was picked by the user and checked by
+    /// `main.rs` (inside the home folder); None uses the default folder.
+    Render(Option<PathBuf>),
     Cancel,
     DismissError,
-    Load { path: PathBuf, name: String },
+    /// `origin`: where the file really is, when the user opened it with
+    /// the file browser. None for an upload.
+    Load { path: PathBuf, name: String, origin: Option<PathBuf> },
+    /// What a `.primitive` save file needs, see `SaveData`.
+    GetSave(oneshot::Sender<SaveData>),
+    /// Opens a `.primitive` save file: loads the source, uses the recipe,
+    /// and puts back the shapes of a still picture.
+    LoadSave { path: PathBuf, name: String, origin: Option<PathBuf>, recipe: serde_json::Value, shapes: Option<SavedShapes> },
     /// A folder of uploaded pictures, named so that they sort in order.
     LoadSequence { dir: PathBuf, name: String },
     Export(oneshot::Sender<Result<ExportData, String>>),
     Quit,
 }
+
+/// The shapes of a still picture in a save file. `w` x `h` is the working
+/// size they were made at; they only fit a picture of that size.
+#[derive(Serialize, Deserialize)]
+pub struct SavedShapes {
+    pub w: i32,
+    pub h: i32,
+    pub bg: [u8; 4],
+    pub shapes: Vec<Shape>,
+    pub colors: Vec<[u8; 4]>,
+    pub scores: Vec<f64>,
+    /// Where the timeline playhead was, None when it followed the build.
+    pub head: Option<usize>,
+}
+
+/// Everything a `.primitive` save file needs, copied out of the worker.
+pub struct SaveData {
+    pub recipe: serde_json::Value,
+    /// "image", "video", "sequence", or "none".
+    pub kind: &'static str,
+    pub name: String,
+    /// Where the source really is (only known for files opened with the
+    /// file browser).
+    pub origin: Option<PathBuf>,
+    /// The worker's copy of a still picture, to put into the save file.
+    pub work_file: Option<PathBuf>,
+    pub shapes: Option<SavedShapes>,
+}
+
+/// Files that `load` opens as a still picture. Anything else goes to
+/// ffmpeg as a video.
+pub const STILL_EXT: &[&str] = &["png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp", "tga", "ico", "pnm", "ppm", "qoi"];
 
 /// Everything an image export needs, copied out of the worker.
 pub struct ExportData {
@@ -382,6 +428,8 @@ pub struct ExportData {
     pub w: i32,
     pub h: i32,
     pub out_size: u32,
+    /// The recipe, written into PNG and SVG exports (see `recipe.rs`).
+    pub recipe: serde_json::Value,
 }
 
 /// The picture to show: a canvas to encode, or a ready JPEG.
@@ -599,7 +647,11 @@ enum Source {
 pub struct Worker {
     rx: Receiver<Cmd>,
     tmp: PathBuf,
+    /// The default folder for renders.
     renders: PathBuf,
+    /// The folder of the current or last render, shared with the download
+    /// routes in `main.rs`.
+    render_dir: Arc<Mutex<PathBuf>>,
     settings: Settings,
     /// `restart_key` of the settings the current job was started with.
     applied: (u32, String, String, String),
@@ -643,6 +695,8 @@ pub struct Worker {
     /// go back to when the video is decoded again.
     restart_view: Option<usize>,
     built_area: Option<BuiltArea>,
+    /// Where the loaded file really is, when it came from the file browser.
+    origin: Option<PathBuf>,
     /// Still picture: the keyframes of each setting.
     tracks: std::collections::BTreeMap<String, Track>,
     /// The painted areas that keyframes use.
@@ -711,6 +765,7 @@ impl Worker {
         rx: Receiver<Cmd>,
         tmp: PathBuf,
         renders: PathBuf,
+        render_dir: Arc<Mutex<PathBuf>>,
         status_tx: Arc<watch::Sender<String>>,
         original_tx: watch::Sender<Arc<Vec<u8>>>,
         pics: Arc<PicSlot>,
@@ -721,6 +776,7 @@ impl Worker {
             rx,
             tmp,
             renders,
+            render_dir,
             applied: settings.restart_key(),
             mask: None,
             used_seed: 0,
@@ -753,6 +809,7 @@ impl Worker {
             key_masks: Vec::new(),
             start_state: (Settings::default(), None),
             shape_view: None,
+            origin: None,
             key_sig: None,
             mask_rev: 0,
         }
@@ -1083,16 +1140,28 @@ impl Worker {
                     self.seek(f);
                 }
             }
-            Cmd::Render => self.start_render(),
+            Cmd::Render(dir) => self.start_render(dir),
             Cmd::Cancel => self.cancel_render(),
             Cmd::DismissError => self.error = None,
-            Cmd::Load { path, name } => {
+            Cmd::Load { path, name, origin } => {
                 if self.render.is_some() {
                     self.fail("A render is running. Cancel it before loading a new file.");
                     let _ = std::fs::remove_file(&path);
                     return;
                 }
                 self.load(path, name);
+                self.origin = origin;
+            }
+            Cmd::GetSave(reply) => {
+                let _ = reply.send(self.save_data());
+            }
+            Cmd::LoadSave { path, name, origin, recipe, shapes } => {
+                if self.render.is_some() {
+                    self.fail("A render is running. Cancel it before opening a save file.");
+                    let _ = std::fs::remove_file(&path);
+                    return;
+                }
+                self.load_save(path, name, origin, recipe, shapes);
             }
             Cmd::LoadSequence { dir, name } => {
                 if self.render.is_some() {
@@ -1132,6 +1201,16 @@ impl Worker {
             }
             Cmd::GetMask(reply) => {
                 let _ = reply.send(self.mask.clone());
+            }
+            Cmd::GetRecipe(reply) => {
+                let _ = reply.send(self.recipe());
+            }
+            Cmd::Recipe(r) => {
+                if self.render.is_some() {
+                    self.fail("A render is running. Cancel it before loading a recipe.");
+                    return;
+                }
+                self.apply_recipe(r);
             }
             Cmd::Quit => {}
         }
@@ -1294,6 +1373,113 @@ impl Worker {
         if let Some(n) = first {
             self.rebuild_from(n);
             self.show_head_values();
+        }
+    }
+
+    // --------------------------------------------------------------- recipe
+
+    /// The recipe of the current work. Keyed settings and the painted area
+    /// hold their values from before the first keyframe.
+    fn recipe(&self) -> serde_json::Value {
+        let mut settings = serde_json::to_value(&self.settings).unwrap_or_default();
+        if let Some(s) = settings.as_object_mut() {
+            // Worked out by the program from `out_preset` and the source.
+            s.remove("out_size");
+        }
+        let area_text = |id: &serde_json::Value| {
+            let area = id.as_u64().and_then(|i| self.key_masks.get(i as usize)).cloned().flatten();
+            area.as_ref().and_then(recipe::area_to_text).map_or(serde_json::Value::Null, serde_json::Value::String)
+        };
+        let mut area = self.mask.as_ref().and_then(recipe::area_to_text);
+        let mut keys = serde_json::Map::new();
+        for (field, t) in &self.tracks {
+            let list: Vec<serde_json::Value> = if field == MASK_KEY {
+                area = area_text(&t.start).as_str().map(str::to_string);
+                t.keys.iter().map(|(at, v)| json!([at, area_text(v)])).collect()
+            } else {
+                settings[field.as_str()] = t.start.clone();
+                t.keys.iter().map(|(at, v)| json!([at, v])).collect()
+            };
+            keys.insert(field.clone(), json!({ "smooth": t.smooth, "keys": list }));
+        }
+        json!({ "app": "primitive-gui", "recipe": recipe::VERSION, "settings": settings, "area": area, "keys": keys })
+    }
+
+    /// `value` as the setting `field`, when it fits that setting.
+    fn setting_value(&self, field: &str, value: &serde_json::Value) -> Option<serde_json::Value> {
+        let mut s = serde_json::to_value(&self.settings).ok()?;
+        let slot = s.as_object_mut()?.get_mut(field)?;
+        *slot = value.clone();
+        serde_json::from_value::<Settings>(s).ok()?;
+        Some(value.clone())
+    }
+
+    /// Uses a recipe. A setting that is missing or does not fit keeps its
+    /// value, so files from older and newer versions still load. A recipe
+    /// replaces the painted area and all keyframes, and a still picture
+    /// starts again (the build waits for Play). An older settings file
+    /// (no "recipe" number) changes only the settings.
+    fn apply_recipe(&mut self, r: serde_json::Value) {
+        let mut next = serde_json::to_value(&self.settings).unwrap_or_default();
+        if let Some(given) = r["settings"].as_object() {
+            for (k, v) in given.iter().filter(|(k, _)| *k != "out_size") {
+                if let Some(v) = self.setting_value(k, v) {
+                    next[k.as_str()] = v;
+                }
+            }
+        }
+        if let Ok(s) = serde_json::from_value::<Settings>(next) {
+            self.apply_settings(s.clamped());
+        }
+        if r["recipe"].as_u64().is_none() {
+            return;
+        }
+        let dims = self.model.as_ref().map(|m| (m.w as u32, m.h as u32));
+        let fit = |a: Option<MaskData>| a.map(|a| dims.map_or(a.clone(), |(w, h)| recipe::fit_area(a, w, h)));
+        self.mask = fit(recipe::area_from_text(&r["area"]));
+        self.mask_rev += 1;
+        self.tracks.clear();
+        self.key_masks.clear();
+        self.shape_view = None;
+        self.key_sig = None;
+        if matches!(self.source, Source::Image(_)) {
+            let last = self.settings.count.saturating_sub(1);
+            for (field, t) in r["keys"].as_object().into_iter().flatten() {
+                if !KEYABLE.contains(&field.as_str()) {
+                    continue;
+                }
+                let mut keys = std::collections::BTreeMap::new();
+                for pair in t["keys"].as_array().into_iter().flatten() {
+                    let (Some(at), v) = (pair[0].as_u64(), &pair[1]) else { continue };
+                    let value = if field == MASK_KEY {
+                        let area = fit(recipe::area_from_text(v));
+                        Some(json!(self.mask_id(area)))
+                    } else {
+                        self.setting_value(field, v)
+                    };
+                    if let Some(value) = value {
+                        keys.insert((at as usize).min(last), value);
+                    }
+                }
+                if keys.is_empty() {
+                    continue;
+                }
+                let start = if field == MASK_KEY {
+                    json!(self.mask_id(self.mask.clone()))
+                } else {
+                    serde_json::to_value(&self.settings).map(|s| s[field.as_str()].clone()).unwrap_or_default()
+                };
+                let smooth = t["smooth"].as_bool().unwrap_or(true);
+                self.tracks.insert(field.clone(), Track { start, keys, smooth });
+            }
+        }
+        self.start_state = (self.settings.clone(), self.mask.clone());
+        self.push_constraints();
+        if self.model.is_some() && matches!(self.source, Source::Image(_)) {
+            self.restart();
+            self.playing = false;
+        } else {
+            self.sync_keys();
         }
     }
 
@@ -1461,6 +1647,69 @@ impl Worker {
         self.key_masks.clear();
         self.shape_view = None;
         self.key_sig = None;
+        self.origin = None;
+    }
+
+    // ----------------------------------------------------------- save files
+
+    fn save_data(&self) -> SaveData {
+        let (kind, name, work_file) = match (&self.source, &self.decode) {
+            (Source::Image(i), _) => ("image", i.name.clone(), Some(i.path.clone())),
+            (Source::Video(v), _) => (if v.files.is_some() { "sequence" } else { "video" }, v.name.clone(), None),
+            (Source::None, Some(d)) => (if d.files.is_some() { "sequence" } else { "video" }, d.name.clone(), None),
+            (Source::None, None) => ("none", String::new(), None),
+        };
+        let shapes = match (&self.source, &self.model) {
+            (Source::Image(_), Some(m)) => Some(SavedShapes {
+                w: m.w,
+                h: m.h,
+                bg: m.bg,
+                shapes: m.shapes.clone(),
+                colors: m.colors.clone(),
+                scores: m.scores.clone(),
+                head: self.shape_view,
+            }),
+            _ => None,
+        };
+        SaveData { recipe: self.recipe(), kind, name, origin: self.origin.clone(), work_file, shapes }
+    }
+
+    /// Opens a save file (see `save.rs` in the server). A still picture is
+    /// loaded first, so that the recipe's keyframes have a picture to go
+    /// on, and then gets its shapes back. A video gets the recipe's
+    /// settings first, so that it is decoded only once, at the right size.
+    fn load_save(&mut self, path: PathBuf, name: String, origin: Option<PathBuf>, recipe: serde_json::Value, shapes: Option<SavedShapes>) {
+        let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        if STILL_EXT.contains(&ext.as_str()) {
+            self.load(path, name);
+            if !matches!(self.source, Source::Image(_)) {
+                return;
+            }
+            self.origin = origin;
+            self.apply_recipe(recipe);
+            let Some(saved) = shapes else { return };
+            let Some(m) = &self.model else { return };
+            if saved.w != m.w || saved.h != m.h || saved.bg != m.bg {
+                self.fail("The shapes in this save file do not fit the picture (it has changed since the save), so the picture starts again. The settings and keyframes were loaded.");
+                return;
+            }
+            let Some(m) = &mut self.model else { return };
+            let n = saved.shapes.len().min(saved.colors.len()).min(saved.scores.len()).min(self.settings.count);
+            m.load_shapes(&saved.shapes[..n], &saved.colors[..n], &saved.scores[..n]);
+            self.shape_view = saved.head.filter(|&h| h < n);
+            self.playing = false;
+            self.key_sig = None;
+            self.sync_keys();
+            if self.shape_view.is_some() {
+                self.show_head_values();
+            }
+            self.dirty_pic = true;
+        } else {
+            self.clear_source();
+            self.apply_recipe(recipe);
+            self.load(path, name);
+            self.origin = origin;
+        }
     }
 
     fn load(&mut self, path: PathBuf, name: String) {
@@ -1468,8 +1717,7 @@ impl Worker {
         self.error = None;
         self.render_file = None;
         let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-        let still = ["png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp", "tga", "ico", "pnm", "ppm", "qoi"];
-        let info = if still.contains(&ext.as_str()) {
+        let info = if STILL_EXT.contains(&ext.as_str()) {
             None
         } else {
             match video::probe(&path) {
@@ -2050,19 +2298,21 @@ impl Worker {
 
     // ------------------------------------------------------------ render
 
-    fn start_render(&mut self) {
+    fn start_render(&mut self, dir: Option<PathBuf>) {
         if self.render.is_some() || self.decode.is_some() {
             return;
         }
+        let renders = dir.unwrap_or_else(|| self.renders.clone());
         let Some(v) = self.video() else { return };
         let fmt = self.settings.export_fmt.clone();
         let (sw, sh, scale) = model::output_size(v.w as i32, v.h as i32, self.settings.out_size);
         let (ow, oh) = if fmt.ends_with("-seq") { (sw.max(1), sh.max(1)) } else { ((sw & !1).max(2), (sh & !1).max(2)) };
         let (fps_text, bg0) = (v.info.fps_text.clone(), v.bg0);
         let naming = self.naming();
-        if let Err(e) = std::fs::create_dir_all(&self.renders) {
-            return self.fail(format!("could not make {}: {e}", self.renders.display()));
+        if let Err(e) = std::fs::create_dir_all(&renders) {
+            return self.fail(format!("could not make {}: {e}", renders.display()));
         }
+        *self.render_dir.lock().unwrap() = renders.clone();
         let sink = match fmt.as_str() {
             "png-seq" | "jpg-seq" | "svg-seq" => {
                 let ext: &'static str = match fmt.as_str() {
@@ -2070,7 +2320,7 @@ impl Worker {
                     "jpg-seq" => "jpg",
                     _ => "svg",
                 };
-                let dir = export::unique(&self.renders, &naming.single(), "");
+                let dir = export::unique(&renders, &naming.single(), "");
                 if let Err(e) = std::fs::create_dir_all(&dir) {
                     return self.fail(format!("could not make {}: {e}", dir.display()));
                 }
@@ -2082,9 +2332,9 @@ impl Worker {
                     "gif" => "gif",
                     _ => "mp4",
                 };
-                let final_path = export::unique(&self.renders, &naming.single(), container);
+                let final_path = export::unique(&renders, &naming.single(), container);
                 let file = final_path.file_name().unwrap().to_string_lossy().to_string();
-                let video_only = self.renders.join(format!(".{file}.video.{container}"));
+                let video_only = renders.join(format!(".{file}.video.{container}"));
                 match video::start_encode(ow, oh, &fps_text, &video_only, container) {
                     Ok((child, stdin)) => Sink::Video { child, stdin, video_only, final_path, container },
                     Err(e) => return self.fail(e),
@@ -2305,7 +2555,11 @@ impl Worker {
         // A video: the frame on screen.
         let (stem, shapes, colors, bg) = match &self.source {
             Source::None => return Err("Load a picture or a video first.".into()),
-            Source::Image(_) => (self.naming().single(), m.shapes.clone(), m.colors.clone(), m.bg),
+            // A still picture: the shapes up to the timeline playhead.
+            Source::Image(_) => {
+                let n = self.shape_view.unwrap_or(m.shapes.len()).min(m.shapes.len());
+                (self.naming().single(), m.shapes[..n].to_vec(), m.colors[..n].to_vec(), m.bg)
+            }
             Source::Video(v) => {
                 let i = v.view.min(v.frames.len().saturating_sub(1));
                 let stem = self.naming().frame(i as u64);
@@ -2356,6 +2610,7 @@ impl Worker {
             w: m.w,
             h: m.h,
             out_size: self.settings.out_size,
+            recipe: self.recipe(),
         })
     }
 
@@ -2467,6 +2722,8 @@ impl Worker {
             "seed": m.map(|_| self.used_seed.to_string()),
             "kind": kind,
             "name": name,
+            // The real place of the file is known (it came from the file browser).
+            "origin": self.origin.is_some(),
             "ready": m.is_some(),
             "work": m.map(|m| [m.w, m.h]),
             "out": [ow, oh],
@@ -2488,7 +2745,7 @@ impl Worker {
             "render": render,
             "render_file": self.render_file,
             "render_folder": self.render_folder,
-            "renders_dir": self.renders.display().to_string(),
+            "renders_dir": self.render_dir.lock().unwrap().display().to_string(),
             "name_example": self.name_example(),
             "error": self.error,
             "original": self.original_version,
